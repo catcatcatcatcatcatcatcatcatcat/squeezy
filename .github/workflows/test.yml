@@ -1,0 +1,62 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+
+    services:
+      lms:
+        image: lmscommunity/lyrionmusicserver:latest
+        ports:
+          - 9000:9000
+          - 3483:3483
+          - 9090:9090
+        volumes:
+          - /tmp/lms-music:/music
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 60s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=test_sink
+
+      - name: Install squeezy and test deps
+        run: pip install -e ".[test]"
+
+      - name: Create music directory
+        run: mkdir -p /tmp/lms-music
+
+      - name: Wait for LMS
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/ > /dev/null && echo "LMS ready" && exit 0
+            sleep 2
+          done
+          echo "LMS failed to start" && exit 1
+
+      - name: Run tests
+        env:
+          LMS_HOST: localhost
+          LMS_MUSIC_DIR: /tmp/lms-music
+          LMS_MUSIC_PATH: /music
+          PULSE_SINK: test_sink
+        run: pytest tests/ -v --timeout=60

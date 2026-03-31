@@ -19,7 +19,7 @@ log = logging.getLogger("squeezy")
 
 SLIMPROTO_PORT = 3483
 DEVICE_ID = 12  # squeezeplay device type
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 STREAM_BUF_MAX = 2 * 1024 * 1024
 SAMPLE_RATE = 44100
 CHANNELS = 2
@@ -62,7 +62,7 @@ def build_stat(event, stream_buf_size=0, stream_buf_full=0,
                bytes_received=0, output_buf_size=0, output_buf_full=0,
                elapsed_ms=0, server_timestamp=0):
     payload = struct.pack(
-        ">4sBBBIIIIHIIIHIIIH",
+        ">4sBBBIIIIHIIIIHIIH",
         event.encode("ascii"),    # event code (4 bytes)
         0,                        # num_crlf
         0,                        # mas_initialized
@@ -75,11 +75,11 @@ def build_stat(event, stream_buf_size=0, stream_buf_full=0,
         gettime_ms(),             # jiffies
         output_buf_size,          # output_buffer_size
         output_buf_full,          # output_buffer_fullness
-        elapsed_ms // 1000,       # elapsed_seconds
-        0,                        # voltage
-        elapsed_ms,               # elapsed_milliseconds
-        server_timestamp,         # server_timestamp (echoed from server)
-        0,                        # error_code
+        elapsed_ms // 1000,       # elapsed_seconds (u32)
+        0,                        # voltage (u16)
+        elapsed_ms,               # elapsed_milliseconds (u32)
+        server_timestamp,         # server_timestamp (u32)
+        0,                        # error_code (u16)
     )
     header = struct.pack(">4sI", b"STAT", len(payload))
     return header + payload
@@ -123,6 +123,13 @@ class PCMBuffer:
         with self.lock:
             return len(self.buf)
 
+    def skip(self, n):
+        """Discard up to n bytes from the buffer. Return bytes actually skipped."""
+        with self.lock:
+            actual = min(n, len(self.buf))
+            del self.buf[:actual]
+            return actual
+
     def flush(self):
         with self.lock:
             self.buf.clear()
@@ -131,10 +138,11 @@ class PCMBuffer:
 # --- Squeezy Player ---
 
 class Squeezy:
-    def __init__(self, name="Squeezy", server=None, mac=None):
+    def __init__(self, name="Squeezy", server=None, mac=None, device_id=None):
         self.name = name
         self.server_ip = server
         self.mac = mac_from_string(mac) if mac else default_mac()
+        self.audio_device_id = device_id
         self.sock = None
         self.running = False
         self.reconnect = False
@@ -157,8 +165,6 @@ class Squeezy:
         self.device = None
         self.playing = False
         self.paused = False
-        self.playback_start_time = 0
-        self.pause_elapsed = 0
         self.start_at_jiffies = 0
         self.output_frames = 0
 
@@ -225,6 +231,8 @@ class Squeezy:
 
     def _send_stat(self, event, server_timestamp=0):
         elapsed = self._elapsed_ms()
+        log.debug("STAT %s elapsed=%dms output_frames=%d stream_bytes=%d",
+                  event, elapsed, self.output_frames, self.stream_bytes)
         pkt = build_stat(
             event,
             stream_buf_size=STREAM_BUF_MAX,
@@ -238,11 +246,8 @@ class Squeezy:
         self._send(pkt)
 
     def _elapsed_ms(self):
-        if not self.playing or self.playback_start_time == 0:
-            return self.pause_elapsed
-        if self.paused:
-            return self.pause_elapsed
-        return self.pause_elapsed + int((time.time() - self.playback_start_time) * 1000)
+        # Frame-based elapsed time — accurate regardless of buffering or pauses
+        return int(self.output_frames * 1000 / SAMPLE_RATE)
 
     def connect(self):
         if not self.server_ip:
@@ -375,15 +380,13 @@ class Squeezy:
             self._handle_strm_start(msg)
 
         elif command == "p":
-            # Pause — replay_gain field = interval in ms (0 = immediate stop)
+            # Pause — replay_gain field = interval in ms (0 = immediate)
             interval = 0
             if len(msg) >= 22:
                 interval = struct.unpack_from(">I", msg, 18)[0]
             if interval:
-                # Pause after interval ms — for MVP, just pause immediately
                 log.debug("Pause with interval %d ms (treating as immediate)", interval)
             if self.playing and not self.paused:
-                self.pause_elapsed = self._elapsed_ms()
                 self.paused = True
                 if self.device:
                     try:
@@ -391,8 +394,8 @@ class Squeezy:
                     except Exception:
                         pass
                     self.device = None
-            if not interval:
-                self._send_stat("STMp")
+            # Always confirm pause to LMS (squeezelite sends STMp regardless of interval)
+            self._send_stat("STMp")
 
         elif command == "u":
             # Unpause with optional sync timestamp
@@ -407,6 +410,19 @@ class Squeezy:
             elif not self.playing and self.pcm_buf.available() > 0:
                 self._start_audio()
             self._send_stat("STMr")
+
+        elif command == "a":
+            # Skip ahead — replay_gain field = milliseconds to skip
+            if len(msg) >= 22:
+                skip_ms = struct.unpack_from(">I", msg, 18)[0]
+                skip_frames = int(skip_ms * SAMPLE_RATE / 1000)
+                skip_bytes = skip_frames * BYTES_PER_FRAME
+                actual = self.pcm_buf.skip(skip_bytes)
+                skipped_frames = actual // BYTES_PER_FRAME
+                self.output_frames += skipped_frames
+                log.info("Skip ahead: %d ms (%d frames requested, %d skipped)",
+                         skip_ms, skip_frames, skipped_frames)
+            self._send_stat("STMc")
 
         elif command == "q":
             # Hard stop — always send STMf
@@ -427,6 +443,10 @@ class Squeezy:
 
         self.autostart = msg[5] - ord("0") if msg[5] >= ord("0") else 0
         fmt = chr(msg[6])
+        pcm_sample_size = msg[7]  # '0'=8, '1'=16, '2'=20, '3'=24, '4'=32
+        pcm_sample_rate = msg[8]  # rate index
+        pcm_channels = msg[9]     # '1'=mono, '2'=stereo
+        pcm_endian = msg[10]      # '0'=big, '1'=little
         threshold = msg[11] * 1024
         server_port = struct.unpack_from(">H", msg, 22)[0]
         server_ip_raw = struct.unpack_from(">I", msg, 24)[0]
@@ -438,8 +458,28 @@ class Squeezy:
         else:
             server_ip = socket.inet_ntoa(struct.pack(">I", server_ip_raw))
 
-        log.info("Stream start: format=%s server=%s:%d threshold=%d autostart=%d",
-                 fmt, server_ip, server_port, threshold, self.autostart)
+        # Parse PCM format details for ffmpeg input
+        # Values are ASCII-encoded per squeezelite protocol (pcm.c)
+        pcm_info = None
+        if fmt == "p":
+            # sample_size: '0'=8bit, '1'=16bit, '2'=20bit, '3'=24bit, '4'=32bit
+            size_map = {ord("0"): 8, ord("1"): 16, ord("2"): 20, ord("3"): 24, ord("4"): 32}
+            bits = size_map.get(pcm_sample_size, 16)
+            # sample_rate: index into squeezelite rate table (ASCII '0'-based)
+            rate_table = [11025, 22050, 32000, 44100, 48000, 8000, 12000,
+                          16000, 24000, 96000, 88200, 176400, 192000, 352800, 384000]
+            rate_idx = pcm_sample_rate - ord("0") if pcm_sample_rate >= ord("0") else 0
+            rate = rate_table[rate_idx] if rate_idx < len(rate_table) else 44100
+            # channels: ASCII digit
+            chans = pcm_channels - ord("0") if pcm_channels >= ord("0") else 2
+            if chans not in (1, 2):
+                chans = 2
+            # endianness: '0'=big, '1'=little
+            endian = "le" if pcm_endian == ord("1") else "be"
+            pcm_info = {"bits": bits, "rate": rate, "channels": chans, "endian": endian}
+
+        log.info("Stream start: format=%s server=%s:%d threshold=%d autostart=%d pcm=%s",
+                 fmt, server_ip, server_port, threshold, self.autostart, pcm_info)
 
         # Stop any existing playback
         self._stop_playback()
@@ -453,7 +493,7 @@ class Squeezy:
 
         self.stream_thread = threading.Thread(
             target=self._stream_worker,
-            args=(server_ip, server_port, http_header, threshold, self.autostart),
+            args=(server_ip, server_port, http_header, threshold, self.autostart, fmt, pcm_info),
             daemon=True,
         )
         self.stream_thread.start()
@@ -503,12 +543,16 @@ class Squeezy:
 
     # --- Streaming ---
 
-    def _stream_worker(self, server_ip, server_port, http_header, threshold, autostart):
+    def _stream_worker(self, server_ip, server_port, http_header, threshold, autostart, fmt="?", pcm_info=None):
         try:
-            self._do_stream(server_ip, server_port, http_header, threshold, autostart)
+            self._do_stream(server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info)
         except Exception as e:
             log.warning("Stream error: %s", e)
         finally:
+            # Wait for decode reader to finish reading ffmpeg output
+            # (don't kill ffmpeg — let it close naturally after stdin is closed)
+            if self.decode_thread and self.decode_thread.is_alive():
+                self.decode_thread.join(timeout=10)
             self.streaming = False
             self._cleanup_ffmpeg()
             try:
@@ -516,7 +560,7 @@ class Squeezy:
             except Exception:
                 pass
 
-    def _do_stream(self, server_ip, server_port, http_header, threshold, autostart):
+    def _do_stream(self, server_ip, server_port, http_header, threshold, autostart, fmt="?", pcm_info=None):
         # Connect to stream server
         log.info("Connecting to stream %s:%d", server_ip, server_port)
         self.stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -539,32 +583,99 @@ class Squeezy:
         resp_headers = bytes(resp_buf[:header_end])
         leftover = bytes(resp_buf[header_end:])
 
-        log.info("Stream response: %s", resp_headers[:80])
+        log.info("Stream response headers:\n%s", resp_headers.decode("ascii", errors="replace"))
 
         # Send RESP and STMc
         self._send(build_resp(resp_headers))
         self._send_stat("STMc")
 
-        # Start ffmpeg decoder
-        self.ffmpeg_proc = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-i", "pipe:0",
-             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-             "pipe:1"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        # For raw PCM at our native format, skip ffmpeg entirely
+        pcm_passthrough = (fmt == "p" and pcm_info
+                           and pcm_info["bits"] == 16 and pcm_info["endian"] == "le"
+                           and pcm_info["rate"] == SAMPLE_RATE
+                           and pcm_info["channels"] == CHANNELS)
 
-        # Start decode reader thread
-        self.decode_thread = threading.Thread(
-            target=self._decode_reader,
-            args=(threshold, autostart),
-            daemon=True,
-        )
-        self.decode_thread.start()
+        if pcm_passthrough:
+            log.info("PCM passthrough (no ffmpeg needed)")
+            # Feed HTTP body directly to PCM buffer
+            self._stream_to_buffer(leftover, threshold, autostart)
+        else:
+            # Build ffmpeg command — specify input format for raw PCM
+            ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if fmt == "p" and pcm_info:
+                ffmpeg_cmd += ["-f", "s{0}{1}".format(pcm_info["bits"], pcm_info["endian"]),
+                               "-ar", str(pcm_info["rate"]),
+                               "-ac", str(pcm_info["channels"])]
+            ffmpeg_cmd += ["-i", "pipe:0",
+                           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+                           "pipe:1"]
+            log.debug("ffmpeg command: %s", " ".join(ffmpeg_cmd))
 
-        # Feed data to ffmpeg
+            self.ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # Start decode reader thread
+            self.decode_thread = threading.Thread(
+                target=self._decode_reader,
+                args=(threshold, autostart),
+                daemon=True,
+            )
+            self.decode_thread.start()
+
+            # Feed data to ffmpeg
+            self._stream_to_ffmpeg(leftover)
+
+    def _stream_to_buffer(self, leftover, threshold, autostart):
+        """Stream raw PCM directly to the PCM buffer (no ffmpeg)."""
+        started = False
+        log.debug("PCM passthrough: leftover=%d bytes, streaming=%s", len(leftover), self.streaming)
+
+        if leftover:
+            self.stream_bytes += len(leftover)
+            self.pcm_buf.write(leftover)
+
+        self.stream_sock.settimeout(5)
+        while self.streaming and self.running:
+            try:
+                data = self.stream_sock.recv(32768)
+                if not data:
+                    break
+                self.stream_bytes += len(data)
+                self.pcm_buf.write(data)
+
+                if (not started and autostart >= 1 and self.cont_received
+                        and self.pcm_buf.available() >= max(threshold, 8192)):
+                    started = True
+                    self._start_audio()
+                    self._send_stat("STMs")
+
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+        # If we never started but have data, start now
+        avail = self.pcm_buf.available()
+        if not started and avail > 0 and autostart >= 1 and self.cont_received:
+            started = True
+            self._start_audio()
+            self._send_stat("STMs")
+
+        self.decode_complete = True
+        log.debug("PCM stream complete, %d bytes buffered (started=%s)", avail, started)
+
+        try:
+            self.stream_sock.close()
+        except Exception:
+            pass
+        self.stream_sock = None
+
+    def _stream_to_ffmpeg(self, leftover):
+        """Feed HTTP stream data to ffmpeg stdin."""
         if leftover:
             self.stream_bytes += len(leftover)
             try:
@@ -604,10 +715,15 @@ class Squeezy:
     def _decode_reader(self, threshold, autostart):
         """Read decoded PCM from ffmpeg stdout into PCM buffer."""
         started = False
+        log.debug("Decode reader started (threshold=%d autostart=%d)", threshold, autostart)
         while self.running:
             try:
+                if not self.ffmpeg_proc:
+                    log.debug("Decode reader: ffmpeg_proc is None, exiting")
+                    break
                 data = self.ffmpeg_proc.stdout.read(8192)
                 if not data:
+                    log.debug("Decode reader: ffmpeg stdout closed")
                     break
                 self.pcm_buf.write(data)
 
@@ -618,8 +734,15 @@ class Squeezy:
                     self._start_audio()
                     self._send_stat("STMs")
 
-            except Exception:
+            except Exception as e:
+                log.debug("Decode reader exception: %s", e)
                 break
+
+        # If we never started playback but have data, start now
+        if not started and self.pcm_buf.available() > 0 and autostart >= 1 and self.cont_received:
+            started = True
+            self._start_audio()
+            self._send_stat("STMs")
 
         # Mark decode complete - STMd is sent from the audio generator
         # only when actively playing (not while paused)
@@ -661,7 +784,6 @@ class Squeezy:
                     continue
                 # Target reached or passed — clear and start playing
                 self.start_at_jiffies = 0
-                self.playback_start_time = time.time()
 
             avail = self.pcm_buf.available()
             if avail > 0:
@@ -702,14 +824,13 @@ class Squeezy:
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
                 sample_rate=SAMPLE_RATE,
+                device_id=self.audio_device_id,
             )
             gen = self._audio_generator()
             next(gen)  # prime the generator before miniaudio calls send()
             self.device.start(gen)
             self.playing = True
             self.paused = False
-            self.pause_elapsed = 0
-            self.playback_start_time = time.time()
             self.output_frames = 0
         except Exception as e:
             log.error("Audio start failed: %s", e)
@@ -737,11 +858,11 @@ class Squeezy:
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
                 sample_rate=SAMPLE_RATE,
+                device_id=self.audio_device_id,
             )
             gen = self._audio_generator()
             next(gen)  # prime the generator
             self.device.start(gen)
-            self.playback_start_time = time.time()
         except Exception as e:
             log.error("Audio resume failed: %s", e)
 
@@ -749,9 +870,22 @@ class Squeezy:
         self.streaming = False
         self.playing = False
         self.paused = False
-        self.playback_start_time = 0
-        self.pause_elapsed = 0
+        self.output_frames = 0
         self.decode_complete = False
+
+        # Close stream socket to unblock any pending recv
+        if self.stream_sock:
+            try:
+                self.stream_sock.close()
+            except Exception:
+                pass
+            self.stream_sock = None
+
+        # Wait for stream thread to finish so it doesn't interfere with a new stream
+        if self.stream_thread and self.stream_thread.is_alive():
+            self.stream_thread.join(timeout=5)
+        self.stream_thread = None
+        self.decode_thread = None
         self.cont_received = False
         self.sent_STMd = False
         self.sent_STMu = False
@@ -765,13 +899,6 @@ class Squeezy:
                 pass
             self.device = None
 
-        if self.stream_sock:
-            try:
-                self.stream_sock.close()
-            except Exception:
-                pass
-            self.stream_sock = None
-
         self._cleanup_ffmpeg()
         self.pcm_buf.flush()
 
@@ -781,11 +908,37 @@ class Squeezy:
         self._stop_playback()
 
 
+def list_audio_devices():
+    """List available audio output devices."""
+    devs = miniaudio.Devices()
+    playbacks = devs.get_playbacks()
+    # The first device miniaudio returns is the system default
+    print("Audio output devices:")
+    for i, d in enumerate(playbacks):
+        tag = " (default)" if i == 0 else ""
+        fmts = ", ".join(f"{f['samplerate']}Hz" for f in d.get("formats", [])[:3])
+        print(f"  {i}: {d['name']}{tag}  [{fmts}]")
+    return playbacks
+
+
+def find_device_id(name):
+    """Find a playback device by name (case-insensitive substring match)."""
+    devs = miniaudio.Devices()
+    playbacks = devs.get_playbacks()
+    needle = name.lower()
+    for d in playbacks:
+        if needle in d["name"].lower():
+            return d["id"], d["name"]
+    return None, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Squeezy - Minimal Squeezebox player")
     parser.add_argument("-s", "--server", help="LMS server IP (auto-discover if not set)")
     parser.add_argument("-n", "--name", default="Squeezy", help="Player name (default: Squeezy)")
     parser.add_argument("-m", "--mac", help="MAC address aa:bb:cc:dd:ee:ff (auto-detect if not set)")
+    parser.add_argument("-d", "--device", help="Audio output device (name or substring, e.g. 'HDMI')")
+    parser.add_argument("-l", "--list-devices", action="store_true", help="List audio output devices and exit")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -795,7 +948,22 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    player = Squeezy(name=args.name, server=args.server, mac=args.mac)
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    # Resolve audio device
+    device_id = None
+    if args.device:
+        device_id, device_name = find_device_id(args.device)
+        if device_id is None:
+            log.error("No audio device matching '%s'. Use -l to list devices.", args.device)
+            return
+        log.info("Audio output: %s", device_name)
+    else:
+        log.info("Audio output: system default")
+
+    player = Squeezy(name=args.name, server=args.server, mac=args.mac, device_id=device_id)
 
     def handle_signal(sig, frame):
         player.stop()

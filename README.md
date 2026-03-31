@@ -51,7 +51,13 @@ squeezy -s 192.168.1.100 -n "Kitchen Speaker"
 # Custom MAC address (for persistent player identity)
 squeezy -m aa:bb:cc:dd:ee:ff
 
-# Debug logging
+# List available audio output devices
+squeezy -l
+
+# Use a specific audio output (substring match, case-insensitive)
+squeezy -d "HDMI" -n "Living Room"
+
+# Debug logging (shows chosen audio device, connection details, etc.)
 squeezy -v
 ```
 

@@ -3,6 +3,7 @@
 
 import argparse
 import array
+import errno
 from importlib.metadata import version as pkg_version
 import json
 import logging
@@ -1342,7 +1343,14 @@ class Squeezy:
 
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                # Retry on transient errors, break on permanent errors
+                if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.ECONNRESET, errno.ECONNABORTED):
+                    log.debug("Stream recv transient error %d — retrying", e.errno)
+                    time.sleep(0.1)
+                    continue
+                # Permanent error or unknown
+                log.debug("Stream error: %s", e)
                 break
 
         # If we never started but have data, try now
@@ -1423,7 +1431,14 @@ class Squeezy:
 
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                # Retry on transient errors, break on permanent errors
+                if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.ECONNRESET, errno.ECONNABORTED):
+                    log.debug("Stream recv transient error %d — retrying", e.errno)
+                    time.sleep(0.1)
+                    continue
+                # Permanent error or unknown
+                log.debug("Stream error: %s", e)
                 break
 
         # Flush any remaining data in buffer

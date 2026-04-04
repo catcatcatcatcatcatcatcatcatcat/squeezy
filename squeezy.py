@@ -402,6 +402,11 @@ class Squeezy:
         self._pending_track = None
         self._track_done = threading.Event()
 
+        # True gapless playback — track boundaries
+        self._current_track_id = 0  # Incremented for each new track
+        self._track_start_frames = 0  # output_frames value when current track started
+        self._switching_track = False  # Flag: generator should switch to pending track
+
         # Status reporting — track metadata and playback info for socket
         # ICY metadata (from in-stream headers, for radio/Shoutcast)
         self.icy_title = ""
@@ -579,10 +584,15 @@ class Squeezy:
         if we've yielded 500ms of audio and 460ms of wall time has passed,
         there's 40ms still sitting in the device buffer.
 
+        For gapless: elapsed time is relative to current track boundary
+        (output_frames since current track started).
+
         Falls back to the static DEVICE_DELAY_MSEC constant until we have
         enough data to measure dynamically (first real audio frame).
         """
-        if self.output_frames == 0:
+        # For true gapless, calculate relative to current track
+        frames_in_track = self.output_frames - self._track_start_frames
+        if frames_in_track <= 0:
             return 0
 
         if self._device_start_time is None:
@@ -591,7 +601,7 @@ class Squeezy:
         else:
             # Dynamic miniaudio buffer depth: frames yielded minus frames played
             # (equivalent to snd_pcm_delay() for the miniaudio layer)
-            frames_since = self.output_frames - self._device_start_frames
+            frames_since = frames_in_track - (self._device_start_frames - self._track_start_frames)
             ms_since = (time.monotonic() - self._device_start_time) * 1000
             buffer_ms = frames_since * 1000 / self.current_sample_rate - ms_since
             # Clamp to sane range
@@ -601,7 +611,7 @@ class Squeezy:
             total_delay_ms = buffer_ms + self.pipeline_latency_msec
             device_delay_frames = int(total_delay_ms * self.current_sample_rate / 1000)
 
-        frames = max(0, self.output_frames - device_delay_frames)
+        frames = max(0, frames_in_track - device_delay_frames)
         return int(frames * 1000 / self.current_sample_rate)
 
     def connect(self):
@@ -959,6 +969,9 @@ class Squeezy:
         self.output_frames = 0
         self._device_start_time = None
         self._device_start_frames = 0
+        # For true gapless playback, increment track boundary
+        self._current_track_id += 1
+        self._track_start_frames = 0
 
         # Reset metadata for new track
         self.icy_title = ""
@@ -1593,6 +1606,20 @@ class Squeezy:
 
     # --- Audio output ---
 
+    def _reset_track_state(self):
+        """Reset state for a new track (true gapless).
+        Called when switching tracks without closing the device."""
+        self._current_track_id += 1
+        self._track_start_frames = self.output_frames
+        self.decode_complete = False
+        self.sent_STMd = False
+        self.sent_STMu = False
+        self.sent_STMo = False
+        self.sent_STMl = False
+        self._switching_track = False
+        log.debug("Track boundary: switching to track #%d at frame %d",
+                  self._current_track_id, self._track_start_frames)
+
     def _audio_generator(self):
         """Generator that yields PCM data for miniaudio playback.
         miniaudio sends framecount via send(), we yield bytes back."""
@@ -1630,12 +1657,6 @@ class Squeezy:
                         self._device_start_time = time.monotonic()
                         self._device_start_frames = self.output_frames
                     self.output_frames += len(chunk) // BYTES_PER_FRAME
-                    # Send STMd once when decode completes (like squeezelite).
-                    # The new strm-s from LMS is handled by queuing, not by
-                    # killing current output.
-                    if self.decode_complete and not self.sent_STMd:
-                        self.sent_STMd = True
-                        self._send_stat("STMd")
                     if len(chunk) < required_bytes:
                         chunk += b"\x00" * (required_bytes - len(chunk))
                     # Apply volume scaling: remote control (audg) × replay gain (strm s)
@@ -1651,11 +1672,41 @@ class Squeezy:
 
             # Buffer empty
             if self.decode_complete and avail == 0:
-                # Track fully played — send STMu (output underrun)
-                if not self.sent_STMu:
-                    self.sent_STMu = True
-                    self._send_stat("STMu")
-                break
+                # Send STMd once when buffer is fully drained (not when decode
+                # finishes). Sending early causes LMS to send the next strm-s
+                # which kills buffered audio.
+                if not self.sent_STMd:
+                    self.sent_STMd = True
+                    self._send_stat("STMd")
+                # Track fully played — check for gapless transition
+                if self._pending_track:
+                    # True gapless: switch to next track without closing device
+                    log.debug("Track complete — gapless switch to pending track")
+                    self._send_stat("STMu")  # Send output underrun for current track
+                    self._reset_track_state()
+                    # Start the new stream (network connection only, device stays open)
+                    server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info = self._pending_track
+                    self._pending_track = None
+                    self.streaming = True
+                    self.stream_bytes = 0
+                    self.cont_received = (autostart < 2)
+                    self.autostart = autostart
+                    # Start stream thread for new track (device already running)
+                    self.stream_thread = threading.Thread(
+                        target=self._stream_worker,
+                        args=(server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info),
+                        daemon=True,
+                    )
+                    self.stream_thread.start()
+                    # Loop continues, waiting for new data
+                    required_frames = yield b"\x00" * required_bytes
+                    continue
+                else:
+                    # No pending track — playback finished
+                    if not self.sent_STMu:
+                        self.sent_STMu = True
+                        self._send_stat("STMu")
+                    break
             elif self.streaming and avail == 0 and not self.sent_STMo:
                 # Buffer underrun while still streaming — send STMo
                 self.sent_STMo = True
@@ -1664,14 +1715,9 @@ class Squeezy:
             # Yield silence while waiting for data
             required_frames = yield b"\x00" * required_bytes
 
-        # Generator exiting — track finished or stopped
+        # Generator exiting — playback stopped (no pending track)
         self.playing = False
         log.info("Playback finished")
-
-        # If a next track was queued (LMS sent strm-s while we were
-        # draining), start it now — like squeezelite's track boundary.
-        if self._pending_track:
-            threading.Thread(target=self._start_pending_track, daemon=True).start()
 
     def _start_audio(self, sample_rate=None):
         if self.playing:

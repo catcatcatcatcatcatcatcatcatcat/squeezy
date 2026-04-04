@@ -1496,9 +1496,19 @@ class Squeezy:
         if not started and self.pcm_buf.available() > 0 and self.cont_received:
             self._check_threshold_start(threshold, autostart, force=True)
 
-        # Mark decode complete — STMd+STMu are sent from the audio
-        # generator when the buffer is fully drained (track finished)
-        self.decode_complete = True
+        # Check ffmpeg exit code — send error packet if non-zero
+        if self.ffmpeg_proc:
+            exit_code = self.ffmpeg_proc.returncode
+            if exit_code and exit_code != 0:
+                log.warning("ffmpeg exited with code %d — sending error packet", exit_code)
+                self._send_stat("STMn")  # STMn = error packet
+            else:
+                # Mark decode complete — STMd+STMu are sent from the audio
+                # generator when the buffer is fully drained (track finished)
+                self.decode_complete = True
+        else:
+            self.decode_complete = True
+
         log.debug("Decode complete, %d bytes buffered", self.pcm_buf.available())
 
     def _cleanup_ffmpeg(self):

@@ -550,7 +550,7 @@ class Squeezy:
             stream_buf_size=STREAM_BUF_MAX,
             stream_buf_full=self.pcm_buf.available(),
             bytes_received=self.stream_bytes,
-            output_buf_size=SAMPLE_RATE * BYTES_PER_FRAME * 10,
+            output_buf_size=self.current_sample_rate * BYTES_PER_FRAME * 10,
             output_buf_full=self.pcm_buf.available(),
             elapsed_ms=elapsed,
             server_timestamp=server_timestamp,
@@ -586,22 +586,22 @@ class Squeezy:
 
         if self._device_start_time is None:
             # Not yet playing real audio — use static estimate
-            device_delay_frames = SAMPLE_RATE * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
+            device_delay_frames = self.current_sample_rate * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
         else:
             # Dynamic miniaudio buffer depth: frames yielded minus frames played
             # (equivalent to snd_pcm_delay() for the miniaudio layer)
             frames_since = self.output_frames - self._device_start_frames
             ms_since = (time.monotonic() - self._device_start_time) * 1000
-            buffer_ms = frames_since * 1000 / SAMPLE_RATE - ms_since
+            buffer_ms = frames_since * 1000 / self.current_sample_rate - ms_since
             # Clamp to sane range
             buffer_ms = max(0.0, min(buffer_ms, DEVICE_BUFFER_MSEC * 2))
             # Add the OS pipeline below miniaudio (CoreAudio/ALSA/WASAPI layer)
             # that snd_pcm_delay() would include but we can't query directly
             total_delay_ms = buffer_ms + self.pipeline_latency_msec
-            device_delay_frames = int(total_delay_ms * SAMPLE_RATE / 1000)
+            device_delay_frames = int(total_delay_ms * self.current_sample_rate / 1000)
 
         frames = max(0, self.output_frames - device_delay_frames)
-        return int(frames * 1000 / SAMPLE_RATE)
+        return int(frames * 1000 / self.current_sample_rate)
 
     def connect(self):
         if not self.server_ip:
@@ -807,7 +807,7 @@ class Squeezy:
             # Skip ahead — replay_gain field = milliseconds to skip
             if len(msg) >= 22:
                 skip_ms = struct.unpack_from(">I", msg, 18)[0]
-                skip_frames = int(skip_ms * SAMPLE_RATE / 1000)
+                skip_frames = int(skip_ms * self.current_sample_rate / 1000)
                 skip_bytes = skip_frames * BYTES_PER_FRAME
                 actual = self.pcm_buf.skip(skip_bytes)
                 skipped_frames = actual // BYTES_PER_FRAME

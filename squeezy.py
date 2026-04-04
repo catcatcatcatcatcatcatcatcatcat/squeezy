@@ -771,13 +771,20 @@ class Squeezy:
             self._send_stat("STMc")
 
         elif command == "q":
-            # Hard stop — always send STMf
+            # Quit streaming entirely — hard stop, always report completion
+            # This command tells the player to stop immediately and disconnect.
+            # We always send STMf to confirm we've stopped.
+            log.debug("Quit command: stopping playback and stream")
             self._stop_playback()
             self._send_stat("STMf")
 
         elif command == "f":
-            # Graceful flush — only send STMf if something was active
+            # Flush output buffer — graceful stop that may allow track queuing
+            # This tells the player to flush the current output buffer and prepare
+            # for the next track. We only send STMf if we were actually playing.
+            # This allows for gapless transitions when a new strm-s arrives.
             was_active = self.streaming or self.playing
+            log.debug("Flush command: stopping current playback (was_active=%s)", was_active)
             self._stop_playback()
             if was_active:
                 self._send_stat("STMf")

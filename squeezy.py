@@ -375,6 +375,7 @@ class Squeezy:
         self.start_at_jiffies = 0
         self.output_frames = 0
         self.volume = 1.0  # 0.0–1.0, set by audg from LMS
+        self.replay_gain = 1.0  # 1.0 = unity, set from strm 's' packet (16.16 fixed-point)
         # OS pipeline latency below miniaudio (overridable via --latency)
         self.pipeline_latency_msec = latency_msec if latency_msec is not None else PLATFORM_PIPELINE_MSEC
 
@@ -872,6 +873,12 @@ class Squeezy:
         pcm_channels = msg[9]
         pcm_endian = msg[10]
         threshold = msg[11] * 1024
+        # Extract replay_gain (16.16 fixed-point at offset 18)
+        if len(msg) >= 22:
+            replay_gain_raw = struct.unpack_from(">I", msg, 18)[0]
+            self.replay_gain = replay_gain_raw / 0x10000 if replay_gain_raw else 1.0
+        else:
+            self.replay_gain = 1.0  # Default if packet too short
         server_port = struct.unpack_from(">H", msg, 22)[0]
         server_ip_raw = struct.unpack_from(">I", msg, 24)[0]
         http_header = msg[28:]
@@ -907,8 +914,8 @@ class Squeezy:
             # For compressed formats, will detect from ffmpeg output later
             self.next_sample_rate = 44100  # Default, may be updated by ffmpeg detection
 
-        log.debug("Stream start: format=%s server=%s:%d threshold=%d autostart=%d pcm=%s",
-                  fmt, server_ip, server_port, threshold, self.autostart, pcm_info)
+        log.debug("Stream start: format=%s server=%s:%d threshold=%d autostart=%d replay_gain=%.2f pcm=%s",
+                  fmt, server_ip, server_port, threshold, self.autostart, self.replay_gain, pcm_info)
 
         stream_args = (server_ip, server_port, http_header, threshold, self.autostart, fmt, pcm_info)
 
@@ -1631,8 +1638,9 @@ class Squeezy:
                         self._send_stat("STMd")
                     if len(chunk) < required_bytes:
                         chunk += b"\x00" * (required_bytes - len(chunk))
-                    # Apply volume scaling (s16le samples)
-                    vol = self.volume
+                    # Apply volume scaling: remote control (audg) × replay gain (strm s)
+                    # Both are normalized to 1.0 = unity gain
+                    vol = self.volume * self.replay_gain
                     if vol < 0.999:
                         samples = array.array("h", chunk)
                         for i in range(len(samples)):

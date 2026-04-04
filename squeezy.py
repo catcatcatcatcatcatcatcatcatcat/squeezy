@@ -8,6 +8,7 @@ from importlib.metadata import version as pkg_version
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -377,6 +378,11 @@ class Squeezy:
         # OS pipeline latency below miniaudio (overridable via --latency)
         self.pipeline_latency_msec = latency_msec if latency_msec is not None else PLATFORM_PIPELINE_MSEC
 
+        # Sample rate tracking (variable sample rate support, like squeezelite)
+        self.current_sample_rate = 44100   # Active playback rate
+        self.next_sample_rate = 44100      # Upcoming track rate
+        self.supported_rates = [44100, 48000, 96000, 192000]
+
         # Dynamic device delay tracking — like squeezelite's snd_pcm_delay().
         # We derive buffer occupancy from wall clock: frames_yielded - frames_played.
         # Set when the first real audio frame (non-silence) is sent to the device.
@@ -422,13 +428,53 @@ class Squeezy:
 
         self._send_lock = threading.Lock()
 
+    def _get_supported_rate(self, requested_rate):
+        """Return the closest supported sample rate, or 44100 as fallback.
+
+        Supported rates: [44100, 48000, 96000, 192000]
+        For unsupported rates (8kHz, 16kHz, etc.), fall back to 44100.
+        """
+        if requested_rate in self.supported_rates:
+            return requested_rate
+        # Fall back to 44100 for unsupported rates
+        return 44100
+
+    def _detect_ffmpeg_rate(self, ffmpeg_proc, timeout=2.0):
+        """Detect sample rate from ffmpeg stderr output.
+
+        Looks for pattern: "Stream #0:0: Audio: <codec>, <rate> Hz"
+        Returns the detected rate, or None if not detected within timeout.
+        """
+        try:
+            import select
+            # Try to read from ffmpeg stderr with timeout
+            start = time.time()
+            while time.time() - start < timeout:
+                # Use select (Unix) or try a short blocking read
+                ready = select.select([ffmpeg_proc.stderr], [], [], 0.1)
+                if ready[0]:
+                    line = ffmpeg_proc.stderr.readline().decode('utf-8', errors='ignore')
+                    if line:
+                        # Look for "Stream #0:0: Audio: mp3, 48000 Hz"
+                        match = re.search(r'(\d+)\s+Hz', line)
+                        if match:
+                            rate = int(match.group(1))
+                            log.debug("Detected ffmpeg sample rate: %d Hz", rate)
+                            return rate
+        except (ImportError, AttributeError):
+            # select not available (Windows) or ffmpeg_proc.stderr issues
+            pass
+        except Exception as e:
+            log.debug("Error detecting ffmpeg rate: %s", e)
+        return None
+
     def _capabilities(self):
         # The capabilities string is sent in the HELO packet and tells LMS
         # what this player can do.  LMS uses it to decide:
         #   - Which codec to use (we list what ffmpeg can decode for us)
         #   - Whether to send AccuratePlayPoints (we say yes — we track frames)
         #   - What model name to show in the LMS UI
-        #   - The maximum sample rate we support (currently hardcoded to 44100)
+        #   - The maximum sample rate we support (44.1k, 48k, 96k, 192k)
         #
         # Key fields (from squeezelite/slimproto.c BASE_CAP):
         #   Model=squeezelite  — tells LMS to treat us like a squeezelite player
@@ -441,7 +487,7 @@ class Squeezy:
         return (
             f"Model=squeezelite,ModelName={self.name},"
             f"AccuratePlayPoints=1,HasDigitalOut=1,HasPolarityInversion=1,"
-            f"Firmware={VERSION},MaxSampleRate={SAMPLE_RATE},"
+            f"Firmware={VERSION},MaxSampleRate=192000,"
             f"pcm,mp3,flac,ogg,aac"
         )
 
@@ -504,7 +550,7 @@ class Squeezy:
             stream_buf_size=STREAM_BUF_MAX,
             stream_buf_full=self.pcm_buf.available(),
             bytes_received=self.stream_bytes,
-            output_buf_size=SAMPLE_RATE * BYTES_PER_FRAME * 10,
+            output_buf_size=self.current_sample_rate * BYTES_PER_FRAME * 10,
             output_buf_full=self.pcm_buf.available(),
             elapsed_ms=elapsed,
             server_timestamp=server_timestamp,
@@ -540,22 +586,22 @@ class Squeezy:
 
         if self._device_start_time is None:
             # Not yet playing real audio — use static estimate
-            device_delay_frames = SAMPLE_RATE * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
+            device_delay_frames = self.current_sample_rate * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
         else:
             # Dynamic miniaudio buffer depth: frames yielded minus frames played
             # (equivalent to snd_pcm_delay() for the miniaudio layer)
             frames_since = self.output_frames - self._device_start_frames
             ms_since = (time.monotonic() - self._device_start_time) * 1000
-            buffer_ms = frames_since * 1000 / SAMPLE_RATE - ms_since
+            buffer_ms = frames_since * 1000 / self.current_sample_rate - ms_since
             # Clamp to sane range
             buffer_ms = max(0.0, min(buffer_ms, DEVICE_BUFFER_MSEC * 2))
             # Add the OS pipeline below miniaudio (CoreAudio/ALSA/WASAPI layer)
             # that snd_pcm_delay() would include but we can't query directly
             total_delay_ms = buffer_ms + self.pipeline_latency_msec
-            device_delay_frames = int(total_delay_ms * SAMPLE_RATE / 1000)
+            device_delay_frames = int(total_delay_ms * self.current_sample_rate / 1000)
 
         frames = max(0, self.output_frames - device_delay_frames)
-        return int(frames * 1000 / SAMPLE_RATE)
+        return int(frames * 1000 / self.current_sample_rate)
 
     def connect(self):
         if not self.server_ip:
@@ -761,7 +807,7 @@ class Squeezy:
             # Skip ahead — replay_gain field = milliseconds to skip
             if len(msg) >= 22:
                 skip_ms = struct.unpack_from(">I", msg, 18)[0]
-                skip_frames = int(skip_ms * SAMPLE_RATE / 1000)
+                skip_frames = int(skip_ms * self.current_sample_rate / 1000)
                 skip_bytes = skip_frames * BYTES_PER_FRAME
                 actual = self.pcm_buf.skip(skip_bytes)
                 skipped_frames = actual // BYTES_PER_FRAME
@@ -853,6 +899,13 @@ class Squeezy:
                 chans = 2
             endian = "le" if pcm_endian == ord("1") else "be"
             pcm_info = {"bits": bits, "rate": rate, "channels": chans, "endian": endian}
+
+        # Detect sample rate for this stream (variable sample rate support)
+        if fmt == "p" and pcm_info:
+            self.next_sample_rate = self._get_supported_rate(pcm_info["rate"])
+        else:
+            # For compressed formats, will detect from ffmpeg output later
+            self.next_sample_rate = 44100  # Default, may be updated by ffmpeg detection
 
         log.debug("Stream start: format=%s server=%s:%d threshold=%d autostart=%d pcm=%s",
                   fmt, server_ip, server_port, threshold, self.autostart, pcm_info)
@@ -1261,7 +1314,7 @@ class Squeezy:
                                "-ar", str(pcm_info["rate"]),
                                "-ac", str(pcm_info["channels"])]
             ffmpeg_cmd += ["-i", "pipe:0",
-                           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+                           "-f", "s16le", "-ar", str(self.next_sample_rate), "-ac", str(CHANNELS),
                            "pipe:1"]
             log.debug("ffmpeg command: %s", " ".join(ffmpeg_cmd))
 
@@ -1271,6 +1324,13 @@ class Squeezy:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+
+            # For compressed formats, detect sample rate from ffmpeg output
+            if fmt != "p":
+                detected_rate = self._detect_ffmpeg_rate(self.ffmpeg_proc)
+                if detected_rate:
+                    self.next_sample_rate = self._get_supported_rate(detected_rate)
+                    log.debug("Using detected ffmpeg rate: %d Hz", self.next_sample_rate)
 
             # Start decode reader thread
             self.decode_thread = threading.Thread(
@@ -1605,15 +1665,19 @@ class Squeezy:
         if self._pending_track:
             threading.Thread(target=self._start_pending_track, daemon=True).start()
 
-    def _start_audio(self):
+    def _start_audio(self, sample_rate=None):
         if self.playing:
             return
-        log.info("Starting audio playback")
+
+        # Determine the sample rate to use (variable sample rate support)
+        rate = sample_rate or self.next_sample_rate
+        self.current_sample_rate = self._get_supported_rate(rate)
+        log.info("Starting audio playback at %d Hz", self.current_sample_rate)
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self.current_sample_rate,
                 buffersize_msec=DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
@@ -1636,11 +1700,16 @@ class Squeezy:
         log.debug("Sync start at jiffies=%d (now=%d)", self.start_at_jiffies, gettime_ms())
         self._start_audio()
 
-    def _resume_audio(self):
+    def _resume_audio(self, sample_rate=None):
         if not self.playing:
-            self._start_audio()
+            self._start_audio(sample_rate)
             return
-        log.info("Resuming audio (%d bytes buffered)", self.pcm_buf.available())
+
+        # Determine the sample rate to use (variable sample rate support)
+        rate = sample_rate or self.next_sample_rate
+        self.current_sample_rate = self._get_supported_rate(rate)
+        log.info("Resuming audio at %d Hz (%d bytes buffered)",
+                 self.current_sample_rate, self.pcm_buf.available())
         # Close old device before creating new one
         if self.device:
             try:
@@ -1652,7 +1721,7 @@ class Squeezy:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self.current_sample_rate,
                 buffersize_msec=DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )

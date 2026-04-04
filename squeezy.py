@@ -352,6 +352,7 @@ class Squeezy:
         self.reconnect = False
         self.bytes_received = 0
         self.server_timestamp = 0
+        self._failed_connect_count = 0  # Reconnection fallback to UDP discovery
 
         # Stream state
         self.stream_sock = None
@@ -586,9 +587,18 @@ class Squeezy:
         self.running = True
         while self.running:
             if not self.connect():
+                self._failed_connect_count += 1
+                # After 5 consecutive failures, fall back to UDP discovery
+                if self._failed_connect_count >= 5:
+                    log.info("Failed to connect to %s 5 times — falling back to UDP discovery",
+                             self.server_ip or "server")
+                    self.server_ip = None
+                    self._failed_connect_count = 0
                 log.info("Retrying in 5 seconds...")
                 time.sleep(5)
                 continue
+            # Success — reset failure counter
+            self._failed_connect_count = 0
             try:
                 self._message_loop()
             except Exception as e:

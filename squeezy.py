@@ -1665,15 +1665,19 @@ class Squeezy:
         if self._pending_track:
             threading.Thread(target=self._start_pending_track, daemon=True).start()
 
-    def _start_audio(self):
+    def _start_audio(self, sample_rate=None):
         if self.playing:
             return
-        log.info("Starting audio playback")
+
+        # Determine the sample rate to use (variable sample rate support)
+        rate = sample_rate or self.next_sample_rate
+        self.current_sample_rate = self._get_supported_rate(rate)
+        log.info("Starting audio playback at %d Hz", self.current_sample_rate)
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self.current_sample_rate,
                 buffersize_msec=DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
@@ -1696,11 +1700,16 @@ class Squeezy:
         log.debug("Sync start at jiffies=%d (now=%d)", self.start_at_jiffies, gettime_ms())
         self._start_audio()
 
-    def _resume_audio(self):
+    def _resume_audio(self, sample_rate=None):
         if not self.playing:
-            self._start_audio()
+            self._start_audio(sample_rate)
             return
-        log.info("Resuming audio (%d bytes buffered)", self.pcm_buf.available())
+
+        # Determine the sample rate to use (variable sample rate support)
+        rate = sample_rate or self.next_sample_rate
+        self.current_sample_rate = self._get_supported_rate(rate)
+        log.info("Resuming audio at %d Hz (%d bytes buffered)",
+                 self.current_sample_rate, self.pcm_buf.available())
         # Close old device before creating new one
         if self.device:
             try:
@@ -1712,7 +1721,7 @@ class Squeezy:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=CHANNELS,
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self.current_sample_rate,
                 buffersize_msec=DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )

@@ -377,6 +377,11 @@ class Squeezy:
         # OS pipeline latency below miniaudio (overridable via --latency)
         self.pipeline_latency_msec = latency_msec if latency_msec is not None else PLATFORM_PIPELINE_MSEC
 
+        # Sample rate tracking (variable sample rate support, like squeezelite)
+        self.current_sample_rate = 44100   # Active playback rate
+        self.next_sample_rate = 44100      # Upcoming track rate
+        self.supported_rates = [44100, 48000, 96000, 192000]
+
         # Dynamic device delay tracking — like squeezelite's snd_pcm_delay().
         # We derive buffer occupancy from wall clock: frames_yielded - frames_played.
         # Set when the first real audio frame (non-silence) is sent to the device.
@@ -421,6 +426,17 @@ class Squeezy:
         self._last_server_msg = time.monotonic()
 
         self._send_lock = threading.Lock()
+
+    def _get_supported_rate(self, requested_rate):
+        """Return the closest supported sample rate, or 44100 as fallback.
+
+        Supported rates: [44100, 48000, 96000, 192000]
+        For unsupported rates (8kHz, 16kHz, etc.), fall back to 44100.
+        """
+        if requested_rate in self.supported_rates:
+            return requested_rate
+        # Fall back to 44100 for unsupported rates
+        return 44100
 
     def _capabilities(self):
         # The capabilities string is sent in the HELO packet and tells LMS

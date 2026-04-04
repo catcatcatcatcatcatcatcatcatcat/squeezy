@@ -8,6 +8,7 @@ from importlib.metadata import version as pkg_version
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -437,6 +438,35 @@ class Squeezy:
             return requested_rate
         # Fall back to 44100 for unsupported rates
         return 44100
+
+    def _detect_ffmpeg_rate(self, ffmpeg_proc, timeout=2.0):
+        """Detect sample rate from ffmpeg stderr output.
+
+        Looks for pattern: "Stream #0:0: Audio: <codec>, <rate> Hz"
+        Returns the detected rate, or None if not detected within timeout.
+        """
+        try:
+            import select
+            # Try to read from ffmpeg stderr with timeout
+            start = time.time()
+            while time.time() - start < timeout:
+                # Use select (Unix) or try a short blocking read
+                ready = select.select([ffmpeg_proc.stderr], [], [], 0.1)
+                if ready[0]:
+                    line = ffmpeg_proc.stderr.readline().decode('utf-8', errors='ignore')
+                    if line:
+                        # Look for "Stream #0:0: Audio: mp3, 48000 Hz"
+                        match = re.search(r'(\d+)\s+Hz', line)
+                        if match:
+                            rate = int(match.group(1))
+                            log.debug("Detected ffmpeg sample rate: %d Hz", rate)
+                            return rate
+        except (ImportError, AttributeError):
+            # select not available (Windows) or ffmpeg_proc.stderr issues
+            pass
+        except Exception as e:
+            log.debug("Error detecting ffmpeg rate: %s", e)
+        return None
 
     def _capabilities(self):
         # The capabilities string is sent in the HELO packet and tells LMS
@@ -870,6 +900,13 @@ class Squeezy:
             endian = "le" if pcm_endian == ord("1") else "be"
             pcm_info = {"bits": bits, "rate": rate, "channels": chans, "endian": endian}
 
+        # Detect sample rate for this stream (variable sample rate support)
+        if fmt == "p" and pcm_info:
+            self.next_sample_rate = self._get_supported_rate(pcm_info["rate"])
+        else:
+            # For compressed formats, will detect from ffmpeg output later
+            self.next_sample_rate = 44100  # Default, may be updated by ffmpeg detection
+
         log.debug("Stream start: format=%s server=%s:%d threshold=%d autostart=%d pcm=%s",
                   fmt, server_ip, server_port, threshold, self.autostart, pcm_info)
 
@@ -1287,6 +1324,13 @@ class Squeezy:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+
+            # For compressed formats, detect sample rate from ffmpeg output
+            if fmt != "p":
+                detected_rate = self._detect_ffmpeg_rate(self.ffmpeg_proc)
+                if detected_rate:
+                    self.next_sample_rate = self._get_supported_rate(detected_rate)
+                    log.debug("Using detected ffmpeg rate: %d Hz", self.next_sample_rate)
 
             # Start decode reader thread
             self.decode_thread = threading.Thread(

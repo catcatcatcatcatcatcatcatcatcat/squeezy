@@ -474,7 +474,7 @@ class Squeezy:
         #   - Which codec to use (we list what ffmpeg can decode for us)
         #   - Whether to send AccuratePlayPoints (we say yes — we track frames)
         #   - What model name to show in the LMS UI
-        #   - The maximum sample rate we support (currently hardcoded to 44100)
+        #   - The maximum sample rate we support (44.1k, 48k, 96k, 192k)
         #
         # Key fields (from squeezelite/slimproto.c BASE_CAP):
         #   Model=squeezelite  — tells LMS to treat us like a squeezelite player
@@ -487,7 +487,7 @@ class Squeezy:
         return (
             f"Model=squeezelite,ModelName={self.name},"
             f"AccuratePlayPoints=1,HasDigitalOut=1,HasPolarityInversion=1,"
-            f"Firmware={VERSION},MaxSampleRate={SAMPLE_RATE},"
+            f"Firmware={VERSION},MaxSampleRate=192000,"
             f"pcm,mp3,flac,ogg,aac"
         )
 
@@ -1314,7 +1314,7 @@ class Squeezy:
                                "-ar", str(pcm_info["rate"]),
                                "-ac", str(pcm_info["channels"])]
             ffmpeg_cmd += ["-i", "pipe:0",
-                           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+                           "-f", "s16le", "-ar", str(self.next_sample_rate), "-ac", str(CHANNELS),
                            "pipe:1"]
             log.debug("ffmpeg command: %s", " ".join(ffmpeg_cmd))
 

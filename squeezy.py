@@ -27,6 +27,10 @@ from . import slimproto
 from . import config
 from . import metadata
 
+# Import Phase 2 modules (protocol layer)
+from . import server_connection
+from . import lms_client
+
 log = logging.getLogger("squeezy")
 
 # Import protocol constants from slimproto module

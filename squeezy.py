@@ -22,36 +22,40 @@ import uuid
 
 import miniaudio
 
+# Import Phase 1 modules (foundation)
+from . import slimproto
+from . import config
+from . import metadata
+
 log = logging.getLogger("squeezy")
 
-SLIMPROTO_PORT = 3483
-DEVICE_ID = 12  # squeezeplay device type
+# Import protocol constants from slimproto module
+SLIMPROTO_PORT = slimproto.SLIMPROTO_PORT
+DEVICE_ID = slimproto.DEVICE_ID
+STREAM_BUF_MAX = slimproto.STREAM_BUF_MAX
+SAMPLE_RATE = slimproto.SAMPLE_RATE
+CHANNELS = slimproto.CHANNELS
+BYTES_PER_FRAME = slimproto.BYTES_PER_FRAME
+DEVICE_BUFFER_MSEC = slimproto.DEVICE_BUFFER_MSEC
+PLATFORM_PIPELINE_MSEC = slimproto.PLATFORM_PIPELINE_MSEC
+DEVICE_DELAY_MSEC = slimproto.DEVICE_DELAY_MSEC
+
 VERSION = pkg_version("squeezy")
-STREAM_BUF_MAX = 2 * 1024 * 1024
-SAMPLE_RATE = 44100
-CHANNELS = 2
-BYTES_PER_FRAME = 4  # 16-bit stereo = 4 bytes per frame
 # Note: P2.6 32-bit audio support planned for future release
 # Would require updating to s32le format and 32-bit sample processing
-DEVICE_BUFFER_MSEC = 40   # miniaudio device buffer size (squeezelite uses 40ms for ALSA)
 
-# Platform pipeline latency — the OS audio stack depth below miniaudio's buffer.
-# squeezelite measures this directly via snd_pcm_delay() which returns the full
-# hardware depth.  We can't query it through miniaudio, so we use a platform
-# default for the layer between miniaudio and the DAC.
-# Override at runtime with --latency.
-import sys as _sys
-if _sys.platform == "darwin":
-    PLATFORM_PIPELINE_MSEC = 40   # CoreAudio HAL buffer + IOAudio kernel stack
-elif _sys.platform == "win32":
-    PLATFORM_PIPELINE_MSEC = 30   # WASAPI shared mode
-else:
-    PLATFORM_PIPELINE_MSEC = 10   # Linux ALSA (thinner stack)
-
-DEVICE_DELAY_MSEC = DEVICE_BUFFER_MSEC + PLATFORM_PIPELINE_MSEC  # total fallback
+# Backward compatibility: import utility functions from slimproto module
+gettime_ms = slimproto.gettime_ms
+mac_from_string = slimproto.mac_from_string
+default_mac = slimproto.default_mac
+build_helo = slimproto.build_helo
+build_stat = slimproto.build_stat
+build_dsco = slimproto.build_dsco
+build_resp = slimproto.build_resp
+build_setd = slimproto.build_setd
 
 
-def gettime_ms():
+def _gettime_ms_deprecated():
     """Return a 32-bit millisecond timestamp — "jiffies" in the SlimProto protocol.
 
     LMS and all players share this same definition: milliseconds since the Unix

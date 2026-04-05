@@ -12,6 +12,7 @@ import re
 import signal
 import socket
 import struct
+import ssl
 import subprocess
 import sys
 import threading
@@ -30,6 +31,8 @@ STREAM_BUF_MAX = 2 * 1024 * 1024
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_FRAME = 4  # 16-bit stereo = 4 bytes per frame
+# Note: P2.6 32-bit audio support planned for future release
+# Would require updating to s32le format and 32-bit sample processing
 DEVICE_BUFFER_MSEC = 40   # miniaudio device buffer size (squeezelite uses 40ms for ALSA)
 
 # Platform pipeline latency — the OS audio stack depth below miniaudio's buffer.
@@ -344,8 +347,56 @@ class StatusSocketServer:
 # --- Squeezy Player ---
 
 class Squeezy:
+    @staticmethod
+    def _get_config_dir():
+        """Get the squeezy config directory, creating it if necessary.
+
+        Uses XDG_CONFIG_HOME if set, otherwise ~/.config/squeezy
+        """
+        config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        config_dir = os.path.join(config_home, "squeezy")
+        os.makedirs(config_dir, exist_ok=True)
+        return config_dir
+
+    @staticmethod
+    def _load_player_name():
+        """Load player name from config file.
+
+        Returns the saved name, or None if not found.
+        """
+        try:
+            config_dir = Squeezy._get_config_dir()
+            name_file = os.path.join(config_dir, "player_name")
+            if os.path.exists(name_file):
+                with open(name_file, "r") as f:
+                    name = f.read().strip()
+                    if name:
+                        log.debug("Loaded player name from %s: %s", name_file, name)
+                        return name
+        except Exception as e:
+            log.warning("Failed to load player name: %s", e)
+        return None
+
+    @staticmethod
+    def _save_player_name(name):
+        """Save player name to config file.
+
+        Args:
+            name: The player name to save
+        """
+        try:
+            config_dir = Squeezy._get_config_dir()
+            name_file = os.path.join(config_dir, "player_name")
+            with open(name_file, "w") as f:
+                f.write(name)
+            log.debug("Saved player name to %s: %s", name_file, name)
+        except Exception as e:
+            log.warning("Failed to save player name: %s", e)
+
     def __init__(self, name="Squeezy", server=None, mac=None, device_id=None, latency_msec=None):
-        self.name = name
+        # Try to load saved player name, fall back to provided name
+        saved_name = self._load_player_name()
+        self.name = saved_name if saved_name else name
         self.server_ip = server
         self.mac = mac_from_string(mac) if mac else default_mac()
         self.audio_device_id = device_id
@@ -484,6 +535,65 @@ class Squeezy:
             log.debug("Error detecting ffmpeg rate: %s", e)
         return None
 
+    @staticmethod
+    def _probe_ffmpeg_codecs():
+        """Probe ffmpeg for available decoders.
+
+        Returns a list of codec short names that ffmpeg supports.
+        Falls back to a standard list if probing fails.
+        """
+        standard_codecs = ["pcm", "mp3", "flac", "ogg", "aac"]
+
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-decoders"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return standard_codecs
+
+            # Parse decoder list: look for common audio codecs
+            # Format is roughly: " DEA... libopus ..."
+            decoders = set()
+            for line in result.stdout.split('\n'):
+                if not line.startswith(' '):
+                    continue
+                # Extract codec name (after DEA flags)
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                codec = parts[1]
+
+                # Map ffmpeg codec names to SlimProto short names
+                codec_map = {
+                    'mp3': 'mp3', 'libmp3lame': 'mp3',
+                    'flac': 'flac',
+                    'pcm_s16le': 'pcm', 'pcm_s24le': 'pcm',
+                    'vorbis': 'ogg', 'libvorbis': 'ogg',
+                    'aac': 'aac', 'aac_fixed': 'aac',
+                    'alac': 'alc',
+                    'libopus': 'ops', 'opus': 'ops',
+                    'wmav1': 'wma', 'wmav2': 'wma', 'wmalossless': 'wma',
+                    'dsf': 'dsd', 'dsd_lsbf': 'dsd',
+                }
+
+                if codec in codec_map:
+                    decoders.add(codec_map[codec])
+
+            # Always include PCM as fallback
+            decoders.add('pcm')
+
+            result_list = sorted(list(decoders))
+            if result_list:
+                log.debug("Detected ffmpeg decoders: %s", result_list)
+                return result_list
+        except Exception as e:
+            log.debug("Failed to probe ffmpeg codecs: %s, using defaults", e)
+
+        return standard_codecs
+
     def _capabilities(self):
         # The capabilities string is sent in the HELO packet and tells LMS
         # what this player can do.  LMS uses it to decide:
@@ -500,11 +610,17 @@ class Squeezy:
         #   Firmware=VERSION   — shown in LMS player settings
         #   MaxSampleRate=N    — highest rate we'll accept (LMS won't send higher)
         #   pcm,mp3,flac,…     — codec list; LMS picks the first one it can serve
+
+        # Probe ffmpeg for available decoders (P2.11: Codec Priority)
+        codecs = self._probe_ffmpeg_codecs()
+        codec_str = ",".join(codecs)
+
         return (
             f"Model=squeezelite,ModelName={self.name},"
             f"AccuratePlayPoints=1,HasDigitalOut=1,HasPolarityInversion=1,"
+            f"CanHTTPS=1,"  # Advertise HTTPS/SSL support
             f"Firmware={VERSION},MaxSampleRate=192000,"
-            f"pcm,mp3,flac,ogg,aac"
+            f"{codec_str}"
         )
 
     # --- Network ---
@@ -1073,6 +1189,7 @@ class Squeezy:
                 new_name = msg[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
                 if new_name:
                     self.name = new_name
+                    self._save_player_name(new_name)  # Persist to file
                     log.info("Player name set to: %s", self.name)
                 name_data = self.name.encode("utf-8") + b"\x00"
                 self._send(build_setd(0, name_data))
@@ -1081,10 +1198,24 @@ class Squeezy:
         log.debug("aude received")
 
     def _handle_cont(self, msg):
+        """Handle CONT (continuation) packet for sync group playback and metaint updates.
+
+        CONT packet format (from squeezelite slimproto.c:399-415):
+        - Used for synchronized playback (autostart >= 2)
+        - May include metaint field for ICY metadata interval
+        """
         log.debug("cont received (autostart was %d)", self.autostart)
         if self.autostart >= 2:
             self.autostart -= 2
             self.cont_received = True
+
+        # Extract metaint from CONT packet if present (for ICY metadata support)
+        # CONT packet may include metaint at offset 4 (u32 big-endian)
+        if len(msg) >= 8:
+            metaint = struct.unpack_from(">I", msg, 4)[0]
+            if metaint > 0:
+                self.icy_meta_int = metaint
+                log.debug("CONT metaint updated to %d bytes", metaint)
 
     def _handle_serv(self, msg):
         if len(msg) >= 8:
@@ -1304,6 +1435,18 @@ class Squeezy:
         self.stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.stream_sock.settimeout(10)
         self.stream_sock.connect((server_ip, server_port))
+
+        # Wrap with SSL if port is 443 (HTTPS) or if SSL is signaled
+        if server_port == 443:
+            try:
+                context = ssl.create_default_context()
+                self.stream_sock = context.wrap_socket(
+                    self.stream_sock,
+                    server_hostname=server_ip
+                )
+                log.debug("SSL/TLS negotiated for HTTPS stream")
+            except Exception as e:
+                log.warning("SSL negotiation failed, continuing with HTTP: %s", e)
 
         # Send HTTP request
         self.stream_sock.sendall(http_header)

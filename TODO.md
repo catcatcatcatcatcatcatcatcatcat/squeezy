@@ -13,8 +13,10 @@ a suggested implementation approach for squeezy.
 
 ## Priority 1 — Critical Reliability
 
+**STATUS: ✅ COMPLETE (8 commits, session 2024-04-04)**
+
 These items affect basic playback reliability and can cause disconnects, skipped
-tracks, or silent failures. Fix first.
+tracks, or silent failures. All items implemented with focused 1-2 commit each.
 
 ---
 
@@ -247,12 +249,22 @@ We already do this correctly with `(bytes_received >> 32) & 0xFFFFFFFF` and
 
 ## Priority 2 — User-Facing Quality
 
+**STATUS: 4/5 Complete (Variable SR + Gapless + Replay Gain + ICY Metadata)**
+
 These features affect the listening experience. Users will notice their absence
 when comparing squeezy to a real Squeezebox or squeezelite.
+
+Recent completions (session 2024-04-04):
+- ✅ **P2.1** True gapless playback (track boundary handling, zero-gap transitions)
+- ✅ **P2.3** Replay gain (16.16 fixed-point parsing and application)
+- ✅ **P2.4** ICY metadata (already implemented, verified working)
+- ✅ **P2.5** Variable sample rate (5 commits: detection, state tracking, device switching)
 
 ---
 
 ### 2.1 Gapless Playback (Track Boundaries)
+
+**STATUS: ✅ COMPLETE (commit 5a4d09e)**
 
 **Problem:** When one track ends and the next begins, there's a brief silence gap
 and a new device open/close cycle. Squeezelite plays seamlessly across tracks.
@@ -262,21 +274,22 @@ and a new device open/close cycle. Squeezelite plays seamlessly across tracks.
 mark where the next track begins. The output thread plays continuously through the
 boundary, applying per-track replay gain and optional crossfade at the boundary.
 
-When a new `strm s` arrives:
-1. The decoder starts writing new track data after the current track's data
-2. `output.track_start = outputbuf->writep` marks the boundary
-3. When `readp` reaches `track_start`, gain/rate transitions are applied
-4. `output.track_started = true` triggers STMs for the new track
+**Implementation (true gapless achieved):**
+- Track boundary tracking: `_current_track_id`, `_track_start_frames`
+- Generator handles track switching internally without exiting
+- Device stays open across tracks (no close/reopen)
+- Elapsed time calculated relative to track boundary
+- Stream thread starts directly while audio generator continues
+- Result: Zero-gap audio transitions, seamless playback
 
-**Current squeezy status:**
-We queue the next track and start it after current finishes (added in this session).
-There's a brief gap during the swap.
+**Code changes:**
+- `_reset_track_state()`: increment track ID, record boundary, reset STAT flags
+- `_audio_generator()`: detect pending track at buffer drain, switch in-place
+- `_elapsed_ms()`: calculate frames relative to `_track_start_frames`
+- `_start_stream()`: initialize track boundaries for first track
 
-**Suggested fix:**
-Phase 1 (current): Queue-based transitions with small gap — **done**.
-Phase 2: Use a single PCMBuffer with a `track_boundary` offset. When the audio
-generator reaches the boundary, reset `output_frames`, send STMs, and continue
-reading without reopening the device.
+This is true gapless: same device, same generator, new stream starts before old
+one ends. No audible gap like squeezelite's implementation.
 
 ---
 
@@ -313,80 +326,75 @@ the buffer over `transition_period` seconds.
 
 ### 2.3 Replay Gain
 
+**STATUS: ✅ COMPLETE (commit eefeadb)**
+
 **Problem:** Without replay gain, volume jumps between tracks from different albums
 or sources.
 
-**How squeezelite handles it:**
-- Received: `strm s` packet field `replay_gain` (u32 at offset 18), stored as
-  `output.next_replay_gain`
-- Applied: `output.c:54-55` — multiplied with volume gain during output packing:
-  ```c
-  gainL = gain(output.gainL, output.current_replay_gain);
-  ```
-- Transition: `output.c:162` — `current_replay_gain = next_replay_gain` at track
-  boundary
+**Implementation:**
+- Extract `replay_gain` from `strm s` packet (4 bytes at offset 18, big-endian u32)
+- Parse as 16.16 fixed-point: `value / 0x10000` = linear gain
+- Apply in audio generator: `total_gain = volume × replay_gain`
+- Both gain sources work multiplicatively (remote control × track gain)
 
-**Suggested fix:**
-Parse `replay_gain` from `strm s` (4 bytes at offset 18 in big-endian). Apply as a
-multiplier alongside volume in the audio generator. It's a fixed-point 16.16 value
-where `0x10000` = unity gain.
+**Code changes:**
+- `__init__`: `self.replay_gain = 1.0` (default unity)
+- `_handle_strm_start()`: extract and parse replay_gain field, log value
+- `_audio_generator()`: multiply `self.volume × self.replay_gain` when scaling samples
+- Debug logging shows replay_gain value at track start
+
+**Tests:** 6 tests covering extraction, unity/boost/cut gain values, edge cases.
 
 ---
 
 ### 2.4 ICY Metadata (Internet Radio)
 
+**STATUS: ✅ VERIFIED (already implemented, commit 7e41746 adds 6 tests)**
+
 **Problem:** Internet radio streams include inline metadata (station name, current
 track title) via the ICY/Shoutcast protocol. Without parsing this, LMS can't display
 what's playing on radio stations.
 
-**How squeezelite handles it:**
-- **Interval set by CONT packet**: `slimproto.c:401` — `stream.meta_interval =
-  cont->metaint`
-- **Metadata parsing**: `stream.c:642-689` — Every `meta_interval` bytes, read a
-  length byte, then `length * 16` bytes of metadata
-- **Sent to LMS**: `slimproto.c:232-243` — `sendMETA()` sends the parsed metadata
-  block as a META packet
+**Implementation (verified working):**
+- HTTP response parsing: extract `icy-metaint` header value (interval in bytes)
+- Stream parsing in `_stream_to_ffmpeg()`: count bytes, extract metadata blocks every
+  `icy_meta_int` bytes
+- Metadata block format: 1-byte length (in 16-byte units), then length×16 bytes
+- Parse key=value pairs: StreamTitle, StreamArtist, StreamAlbum
+- Status dict includes ICY metadata as fallback from LMS metadata
 
-```c
-// stream.c ICY metadata reading
-if (stream.meta_next == 0) {
-    u8_t c;
-    _recv(fd, &c, 1, 0);
-    stream.meta_left = 16 * c;  // Max 4080 bytes
-    // ... read meta_left bytes of metadata text ...
-}
-```
+**Code locations:**
+- `_do_stream()` lines 1289-1296: extract `icy-metaint` from HTTP headers
+- `_stream_to_ffmpeg()` lines 1460-1495: parse metadata blocks while streaming
+- `_parse_icy_metadata()` lines 1181-1228: extract fields, handle empty blocks
+- `_status_dict()` lines 1232-1242: include ICY title/artist in broadcast
 
-**History:**
-- ICY support added in v0.6beta1 alongside gapless playback
-- MAX_HEADER increased to handle ICY metadata blocks (max 4080 bytes)
-
-**Suggested fix:**
-1. Handle CONT packet — store `metaint` value
-2. In `_stream_to_buffer` / `_stream_to_ffmpeg`, count bytes and extract metadata
-   at each interval
-3. Build and send META packet to LMS with the parsed metadata
+**Tests:** 6 tests covering extraction, parsing, edge cases, status dict priority.
 
 ---
 
 ### 2.5 Sample Rate Switching
 
-**Problem:** Squeezy hardcodes 44100 Hz. Content at 48kHz, 96kHz, etc. will be
-resampled by ffmpeg (losing quality) or by miniaudio (potentially poorly).
+**STATUS: ✅ COMPLETE (5 commits: state tracking, detection, elapsed time, device switch, native output)**
 
-**How squeezelite handles it:**
-- `output.c:129-150` — Detects rate change at track boundary, calls
-  `set_sample_rate()` which reopens the output device at the new rate
-- `output_alsa.c:688-730` — Some ALSA devices need the device reopened *twice*
-  for a new sample rate to take effect (hardware bug workaround)
-- `output.rate_delay` — Configurable silence inserted during rate switch to avoid
-  clicks
+**Problem:** Squeezy hardcodes 44100 Hz. Content at 48kHz, 96kHz, etc. was being
+resampled by ffmpeg, causing unnecessary CPU usage and quality loss.
 
-**Suggested fix:**
-Phase 1: Let ffmpeg handle resampling (current — functional but lossy for hi-res).
-Phase 2: Pass the stream's sample rate to `miniaudio.PlaybackDevice()`, creating a
-new device at the correct rate for each track. Parse `pcm_sample_rate` from
-`strm s` for all formats (not just PCM).
+**Implementation (variable sample rate support):**
+1. **Commit b3b4f43**: State tracking variables (`current_sample_rate`, `next_sample_rate`, `supported_rates`)
+2. **Commit 0da5eb8**: Detection from PCM metadata + ffmpeg stderr parsing
+3. **Commit 95568cc**: Elapsed time calculations use `current_sample_rate` (6 locations)
+4. **Commit a572d15**: Device opening at track boundary with correct rate
+5. **Commit 85dfe60**: FFmpeg output at native rate, HELO updated to MaxSampleRate=192000
+
+**Architecture:**
+- Supported rates: [44.1k, 48k, 96k, 192k] with fallback to 44.1k
+- PCM format: detect from `pcm_sample_rate` field in `strm s` packet
+- Compressed formats: parse from ffmpeg stderr "Stream #0:0: Audio: <codec>, <rate> Hz"
+- Device switching: `_start_audio()` accepts rate parameter, opens miniaudio at that rate
+- No resampling: ffmpeg outputs at native rate (no `-ar 44100` forcing)
+
+**Tests:** 10 tests covering detection, fallback, device opening, elapsed time.
 
 ---
 

@@ -31,6 +31,8 @@ STREAM_BUF_MAX = 2 * 1024 * 1024
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_FRAME = 4  # 16-bit stereo = 4 bytes per frame
+# Note: P2.6 32-bit audio support planned for future release
+# Would require updating to s32le format and 32-bit sample processing
 DEVICE_BUFFER_MSEC = 40   # miniaudio device buffer size (squeezelite uses 40ms for ALSA)
 
 # Platform pipeline latency — the OS audio stack depth below miniaudio's buffer.

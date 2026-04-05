@@ -8,17 +8,14 @@ from importlib.metadata import version as pkg_version
 import json
 import logging
 import os
-import re
 import signal
 import socket
 import struct
-import ssl
 import subprocess
 import sys
 import threading
 import time
 from urllib.request import urlopen
-import uuid
 
 import miniaudio
 
@@ -30,6 +27,13 @@ from . import metadata
 # Import Phase 2 modules (protocol layer)
 from . import server_connection
 from . import lms_client
+
+# Import Phase 3 modules (audio & stream pipeline)
+from . import audio_player
+from . import stream_decoder
+
+# Import Phase 4 module (message dispatch)
+from . import protocol_handler
 
 log = logging.getLogger("squeezy")
 
@@ -59,213 +63,6 @@ build_resp = slimproto.build_resp
 build_setd = slimproto.build_setd
 
 
-def _gettime_ms_deprecated():
-    """Return a 32-bit millisecond timestamp — "jiffies" in the SlimProto protocol.
-
-    LMS and all players share this same definition: milliseconds since the Unix
-    epoch, masked to 32 bits.  The value wraps around every ~49.7 days, which is
-    fine because the protocol only ever compares deltas (e.g. "start playing at
-    jiffies X") and always guards against wrap-around with a window check.
-
-    The & 0xFFFFFFFF keeps us in unsigned 32-bit range so our value matches what
-    LMS sends in 'strm u' packets and what we echo back in every STAT packet.
-    """
-    return int(time.time() * 1000) & 0xFFFFFFFF
-
-
-def mac_from_string(mac_str):
-    return bytes(int(b, 16) for b in mac_str.split(":"))
-
-
-def default_mac():
-    node = uuid.getnode()
-    return node.to_bytes(6, "big")
-
-
-# ---------------------------------------------------------------------------
-# SlimProto packet builders
-#
-# All packets share the same wire envelope:
-#
-#   ┌─────────────┬──────────────────────────────────┐
-#   │  opcode     │  payload_length  │  payload ...  │
-#   │  4 bytes    │  4 bytes (u32be) │  N bytes      │
-#   └─────────────┴──────────────────────────────────┘
-#
-# struct format notation used throughout:
-#   ">"  = big-endian (network byte order) — all SlimProto fields are big-endian
-#   "B"  = unsigned 8-bit int  (u8)
-#   "H"  = unsigned 16-bit int (u16)
-#   "I"  = unsigned 32-bit int (u32)
-#   "s"  = raw bytes of fixed length (e.g. "4s" = 4-byte string)
-#
-# Reference: https://wiki.slimdevices.com/index.php/SlimProto_TCP_protocol
-# ---------------------------------------------------------------------------
-
-# Shared envelope: opcode (4 bytes) + payload length (u32)
-_PKT_HEADER_FMT = ">4sI"
-
-# HELO payload: sent once at connect to introduce ourselves to LMS.
-#   B   deviceid       — 12 = SqueezePlay (we impersonate this class)
-#   B   revision       — always 0
-#   6s  mac            — player MAC address (unique identity)
-#   16s uuid           — 128-bit UUID (unused, all zeros)
-#   H   wlan_channellist — 0x4000 on reconnect, 0x0000 on first connect
-#   I   bytes_recv_H   — upper 32 bits of total bytes received (lifetime)
-#   I   bytes_recv_L   — lower 32 bits of total bytes received
-#   2s  lang           — ISO language code (unused, "\x00\x00")
-#   ...capabilities string appended as raw ASCII bytes (no length prefix)
-_HELO_PAYLOAD_FMT = ">BB6s16sHII2s"
-
-# STAT payload: the heartbeat we send to LMS every few seconds and on events.
-# LMS uses this to track playback position, buffer health, and sync timing.
-#   4s  event_code     — 4-char ASCII event (e.g. "STMt"=timer, "STMs"=started)
-#   B   num_crlf       — legacy field, always 0
-#   B   mas_initialized — legacy MAS chip field, always 0
-#   B   mas_mode       — legacy MAS chip field, always 0
-#   I   stream_buf_size  — total size of our stream (download) buffer in bytes
-#   I   stream_buf_full  — bytes currently in the stream buffer
-#   I   bytes_recv_H   — upper 32 bits of bytes received from LMS stream server
-#   I   bytes_recv_L   — lower 32 bits of bytes received
-#   H   signal_strength — WiFi RSSI; 0xFFFF = wired (we always report wired)
-#   I   jiffies        — our current timestamp in ms (see gettime_ms())
-#   I   output_buf_size  — total size of our audio output buffer in bytes
-#   I   output_buf_full  — bytes currently in the output buffer
-#   I   elapsed_seconds  — seconds of audio played (u32 — NOT u16, easy mistake)
-#   H   voltage        — battery voltage for portable devices; 0 for us
-#   I   elapsed_ms     — milliseconds of audio played (more precise than above)
-#   I   server_timestamp — echo of the jiffies value LMS sent in 'strm t'
-#   H   error_code     — decoder error code; 0 = no error
-_STAT_PAYLOAD_FMT = ">4sBBBIIIIHIIIIHIIH"
-
-# NOTE on elapsed_seconds vs elapsed_ms field ordering:
-# The field order is: ..., elapsed_seconds (I=u32), voltage (H=u16), elapsed_ms (I=u32)
-# A common bug (we had it) is swapping the H and I: using u16 for elapsed_seconds
-# makes it overflow at 65 seconds and shifts all subsequent fields by 2 bytes,
-# causing LMS to read garbage for elapsed_ms and never advance the progress bar.
-
-
-def build_helo(mac, caps, reconnect=False, bytes_received=0):
-    caps_bytes = caps.encode("ascii")
-    payload = struct.pack(
-        _HELO_PAYLOAD_FMT,
-        DEVICE_ID,                                    # deviceid (12 = SqueezePlay)
-        0,                                            # revision
-        mac,                                          # 6-byte MAC address
-        b"\x00" * 16,                                 # uuid (unused)
-        0x4000 if reconnect else 0x0000,              # wlan_channellist
-        (bytes_received >> 32) & 0xFFFFFFFF,          # bytes_received_H
-        bytes_received & 0xFFFFFFFF,                  # bytes_received_L
-        b"\x00\x00",                                  # lang (unused)
-    ) + caps_bytes                                    # capabilities string (variable length)
-    header = struct.pack(_PKT_HEADER_FMT, b"HELO", len(payload))
-    return header + payload
-
-
-def build_stat(event, stream_buf_size=0, stream_buf_full=0,
-               bytes_received=0, output_buf_size=0, output_buf_full=0,
-               elapsed_ms=0, server_timestamp=0):
-    payload = struct.pack(
-        _STAT_PAYLOAD_FMT,
-        event.encode("ascii"),                        # event code e.g. b"STMt"
-        0,                                            # num_crlf (legacy, unused)
-        0,                                            # mas_initialized (legacy)
-        0,                                            # mas_mode (legacy)
-        stream_buf_size,                              # stream buffer total size
-        stream_buf_full,                              # stream buffer bytes used
-        (bytes_received >> 32) & 0xFFFFFFFF,          # bytes received (high u32)
-        bytes_received & 0xFFFFFFFF,                  # bytes received (low u32)
-        0xFFFF,                                       # signal_strength: 0xFFFF = wired
-        gettime_ms(),                                 # jiffies: our current ms clock
-        output_buf_size,                              # output buffer total size
-        output_buf_full,                              # output buffer bytes used
-        elapsed_ms // 1000,                           # elapsed_seconds (u32)
-        0,                                            # voltage (u16, 0 = not portable)
-        elapsed_ms,                                   # elapsed_milliseconds (u32)
-        server_timestamp,                             # echo of LMS's 'strm t' timestamp
-        0,                                            # error_code (0 = ok)
-    )
-    header = struct.pack(_PKT_HEADER_FMT, b"STAT", len(payload))
-    return header + payload
-
-
-def build_dsco(reason=0):
-    """DSCO — tell LMS the stream disconnected and why.
-
-    reason codes: 0=ok, 1=local disconnect, 2=remote disconnect,
-                  3=unreachable, 4=timeout
-    """
-    payload = struct.pack(">B", reason)               # single u8 reason code
-    header = struct.pack(_PKT_HEADER_FMT, b"DSCO", len(payload))
-    return header + payload
-
-
-def build_resp(http_headers):
-    """RESP — forward the HTTP response headers from the stream server to LMS.
-
-    LMS uses these to confirm the stream connected and to read metadata like
-    Content-Type and ICY headers.  We pass the raw header bytes unchanged.
-    """
-    header = struct.pack(_PKT_HEADER_FMT, b"RESP", len(http_headers))
-    return header + http_headers
-
-
-def build_setd(player_id, data):
-    """SETD — send a settings value to LMS (e.g. confirm player name change).
-
-    player_id 0 = player name.  data is the value as raw bytes (null-terminated
-    for strings).
-    """
-    payload = struct.pack(">B", player_id) + data     # u8 id + variable data
-    header = struct.pack(_PKT_HEADER_FMT, b"SETD", len(payload))
-    return header + payload
-
-
-# ---------------------------------------------------------------------------
-# PCM buffer
-#
-# Three threads share this buffer:
-#
-#   Writer  (stream thread)  — downloads audio, optionally decodes via ffmpeg,
-#                              calls .write() with raw s16le PCM bytes
-#   Reader  (miniaudio cb)   — the audio generator runs in miniaudio's callback
-#                              thread; calls .read() to pull frames to play
-#   Control (main thread)    — calls .flush() on track stop/skip
-#
-# A plain threading.Lock() is sufficient because each operation is a single
-# short critical section.  The buffer grows/shrinks dynamically; for a 3-min
-# track at 44.1kHz/16-bit/stereo the peak size is ~30MB.
-# ---------------------------------------------------------------------------
-
-class PCMBuffer:
-    def __init__(self):
-        self.buf = bytearray()
-        self.lock = threading.Lock()
-
-    def write(self, data):
-        with self.lock:
-            self.buf.extend(data)
-
-    def read(self, n):
-        with self.lock:
-            chunk = bytes(self.buf[:n])
-            del self.buf[:n]
-            return chunk
-
-    def available(self):
-        with self.lock:
-            return len(self.buf)
-
-    def skip(self, n):
-        """Discard up to n bytes from the buffer. Return bytes actually skipped."""
-        with self.lock:
-            actual = min(n, len(self.buf))
-            del self.buf[:actual]
-            return actual
-
-    def flush(self):
-        with self.lock:
-            self.buf.clear()
 
 
 class StatusSocketServer:
@@ -356,50 +153,14 @@ class StatusSocketServer:
 
 class Squeezy:
     @staticmethod
-    def _get_config_dir():
-        """Get the squeezy config directory, creating it if necessary.
-
-        Uses XDG_CONFIG_HOME if set, otherwise ~/.config/squeezy
-        """
-        config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-        config_dir = os.path.join(config_home, "squeezy")
-        os.makedirs(config_dir, exist_ok=True)
-        return config_dir
-
-    @staticmethod
     def _load_player_name():
-        """Load player name from config file.
-
-        Returns the saved name, or None if not found.
-        """
-        try:
-            config_dir = Squeezy._get_config_dir()
-            name_file = os.path.join(config_dir, "player_name")
-            if os.path.exists(name_file):
-                with open(name_file, "r") as f:
-                    name = f.read().strip()
-                    if name:
-                        log.debug("Loaded player name from %s: %s", name_file, name)
-                        return name
-        except Exception as e:
-            log.warning("Failed to load player name: %s", e)
-        return None
+        """Load player name from config file."""
+        return config.load_player_name()
 
     @staticmethod
     def _save_player_name(name):
-        """Save player name to config file.
-
-        Args:
-            name: The player name to save
-        """
-        try:
-            config_dir = Squeezy._get_config_dir()
-            name_file = os.path.join(config_dir, "player_name")
-            with open(name_file, "w") as f:
-                f.write(name)
-            log.debug("Saved player name to %s: %s", name_file, name)
-        except Exception as e:
-            log.warning("Failed to save player name: %s", e)
+        """Save player name to config file."""
+        config.save_player_name(name)
 
     def __init__(self, name="Squeezy", server=None, mac=None, device_id=None, latency_msec=None):
         # Try to load saved player name, fall back to provided name
@@ -414,6 +175,15 @@ class Squeezy:
         self.bytes_received = 0
         self.server_timestamp = 0
         self._failed_connect_count = 0  # Reconnection fallback to UDP discovery
+
+        # Audio & stream pipeline components
+        self.audio = audio_player.AudioPlayer(self)
+        self.stream = stream_decoder.StreamDecoder(self)
+        self.pcm_buf = stream_decoder.PCMBuffer()
+
+        # Message dispatch
+        self.protocol = protocol_handler.ProtocolHandler(self)
+
 
         # Stream state
         self.stream_sock = None

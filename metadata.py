@@ -87,37 +87,3 @@ def parse_icy_metadata(data):
         log.debug("ICY metadata parse error: %s", e)
 
     return result
-
-
-def encode_replay_gain(gain_float):
-    """Encode a floating-point gain value to 16.16 fixed-point format.
-
-    The 16.16 format uses 16 bits for the integer part and 16 bits for the
-    fractional part. Example: 0x10000 = 1.0 (unity gain), 0x8000 = 0.5 (-6dB).
-
-    This format is used by LMS in the 'strm s' packet at offset 18.
-
-    Args:
-        gain_float: Gain multiplier (1.0 = unity gain)
-
-    Returns:
-        32-bit unsigned integer in 16.16 fixed-point format
-    """
-    return int(round(gain_float * 0x10000)) & 0xFFFFFFFF
-
-
-def decode_replay_gain(gain_raw):
-    """Decode a 16.16 fixed-point replay gain value to float.
-
-    The format uses 16 bits for the integer part and 16 bits for the fractional
-    part. Example: 0x10000 = 1.0 (unity gain), 0x8000 = 0.5 (-6dB).
-
-    This format is used by LMS in the 'strm s' packet at offset 18.
-
-    Args:
-        gain_raw: 32-bit unsigned integer in 16.16 fixed-point format
-
-    Returns:
-        Floating-point gain multiplier (1.0 = unity gain)
-    """
-    return gain_raw / 0x10000

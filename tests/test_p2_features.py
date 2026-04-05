@@ -403,3 +403,271 @@ class TestP24ICYMetadata:
         status = squeezy._status_dict()
 
         assert status['title'] == "LMS Track"
+
+
+class TestP22Crossfade:
+    """Tests for crossfade support (P2.2)."""
+
+    def test_transition_parameters_initialized(self):
+        """Transition parameters are initialized."""
+        squeezy = Squeezy(name="test")
+        assert squeezy.transition_type == 0
+        assert squeezy.transition_period_sec == 0
+        assert hasattr(squeezy, '_crossfade_enabled')
+        assert hasattr(squeezy, '_fade_in_gains')
+        assert hasattr(squeezy, '_fade_out_gains')
+        assert hasattr(squeezy, '_crossfade_samples')
+        assert hasattr(squeezy, '_crossfade_pos')
+        assert hasattr(squeezy, '_crossfade_total')
+
+    def test_transition_parameters_extracted_from_strm(self):
+        """Transition parameters are extracted from strm 's' packet."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        # Build strm 's' packet with transition params at offsets 13-14
+        msg = bytearray(28 + 10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")  # MP3
+        # Offsets 13-14: transition_period and transition_type (ASCII '0'-'9')
+        msg[13] = ord("3")  # transition_period = 3 seconds
+        msg[14] = ord("1")  # transition_type = 1 (CROSSFADE)
+        struct.pack_into(">I", msg, 18, 0x10000)  # replay_gain
+        struct.pack_into(">H", msg, 22, 3483)
+        struct.pack_into(">I", msg, 24, 0)
+
+        squeezy._handle_strm_start(bytes(msg))
+
+        assert squeezy.transition_type == 1
+        assert squeezy.transition_period_sec == 3
+
+    def test_transition_type_fade_none(self):
+        """Transition type 0 is FADE_NONE."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        msg = bytearray(28 + 10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")
+        msg[13] = ord("2")  # period
+        msg[14] = ord("0")  # type = FADE_NONE
+        struct.pack_into(">I", msg, 18, 0x10000)
+        struct.pack_into(">H", msg, 22, 3483)
+        struct.pack_into(">I", msg, 24, 0)
+
+        squeezy._handle_strm_start(bytes(msg))
+        assert squeezy.transition_type == 0
+
+    def test_transition_type_fade_in(self):
+        """Transition type 2 is FADE_IN."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        msg = bytearray(28 + 10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")
+        msg[13] = ord("2")
+        msg[14] = ord("2")  # type = FADE_IN
+        struct.pack_into(">I", msg, 18, 0x10000)
+        struct.pack_into(">H", msg, 22, 3483)
+        struct.pack_into(">I", msg, 24, 0)
+
+        squeezy._handle_strm_start(bytes(msg))
+        assert squeezy.transition_type == 2
+
+    def test_transition_type_fade_out(self):
+        """Transition type 3 is FADE_OUT."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        msg = bytearray(28 + 10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")
+        msg[13] = ord("2")
+        msg[14] = ord("3")  # type = FADE_OUT
+        struct.pack_into(">I", msg, 18, 0x10000)
+        struct.pack_into(">H", msg, 22, 3483)
+        struct.pack_into(">I", msg, 24, 0)
+
+        squeezy._handle_strm_start(bytes(msg))
+        assert squeezy.transition_type == 3
+
+    def test_transition_type_fade_inout(self):
+        """Transition type 4 is FADE_INOUT."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        msg = bytearray(28 + 10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")
+        msg[13] = ord("2")
+        msg[14] = ord("4")  # type = FADE_INOUT
+        struct.pack_into(">I", msg, 18, 0x10000)
+        struct.pack_into(">H", msg, 22, 3483)
+        struct.pack_into(">I", msg, 24, 0)
+
+        squeezy._handle_strm_start(bytes(msg))
+        assert squeezy.transition_type == 4
+
+    def test_build_fade_curves_linear(self):
+        """Gain curves are linear (0.0 → 1.0 and 1.0 → 0.0)."""
+        squeezy = Squeezy(name="test")
+
+        fade_in, fade_out = squeezy._build_fade_curves(100)
+
+        assert fade_in is not None
+        assert fade_out is not None
+        assert len(fade_in) == 100
+        assert len(fade_out) == 100
+        # Fade-in starts at 0.0
+        assert abs(fade_in[0] - 0.0) < 0.01
+        # Fade-in ends at 99/100 = 0.99
+        assert abs(fade_in[99] - 0.99) < 0.01
+        # Fade-out starts at 1.0
+        assert abs(fade_out[0] - 1.0) < 0.01
+        # Fade-out ends at 1/100 = 0.01
+        assert abs(fade_out[99] - 0.01) < 0.01
+        # Complementary: fade_in + fade_out ≈ 1.0 at any point
+        for i in range(100):
+            assert abs(fade_in[i] + fade_out[i] - 1.0) < 0.01
+
+    def test_build_fade_curves_zero_duration(self):
+        """Zero or negative duration returns None."""
+        squeezy = Squeezy(name="test")
+
+        fade_in, fade_out = squeezy._build_fade_curves(0)
+        assert fade_in is None
+        assert fade_out is None
+
+        fade_in, fade_out = squeezy._build_fade_curves(-100)
+        assert fade_in is None
+        assert fade_out is None
+
+    def test_crossfade_mixing_crossfade_mode(self):
+        """Crossfade mode (1) mixes old fade-out + new fade-in."""
+        squeezy = Squeezy(name="test")
+        squeezy.transition_type = 1  # CROSSFADE
+        squeezy.current_sample_rate = 44100
+        squeezy.transition_period_sec = 1
+        squeezy._crossfade_total = 2  # 2 samples
+        squeezy._crossfade_pos = 0
+
+        # Build gain curves: [0.0, 0.5] for fade_in, [1.0, 0.5] for fade_out
+        fade_in, fade_out = squeezy._build_fade_curves(2)
+        squeezy._fade_in_gains = fade_in
+        squeezy._fade_out_gains = fade_out
+
+        # Old track samples: [1000, 2000]
+        old_sample_bytes = array.array("h", [1000, 2000]).tobytes()
+        squeezy._crossfade_samples = list(old_sample_bytes)
+
+        # New track samples: [3000, 4000]
+        new_chunk = array.array("h", [3000, 4000]).tobytes()
+
+        result = squeezy._apply_crossfade(new_chunk)
+        result_samples = array.array("h", result)
+
+        # At position 0: old * 1.0 + new * 0.0 = 1000 * 1.0 + 3000 * 0.0 = 1000
+        assert abs(result_samples[0] - 1000) < 10
+        # At position 1: old * 0.5 + new * 0.5 = 2000 * 0.5 + 4000 * 0.5 = 3000
+        assert abs(result_samples[1] - 3000) < 10
+        # Crossfade should be complete now
+        assert squeezy._crossfade_pos >= squeezy._crossfade_total
+        assert not squeezy._crossfade_enabled
+
+    def test_crossfade_mixing_fade_in_mode(self):
+        """Fade-in mode (2) applies only fade-in to new track."""
+        squeezy = Squeezy(name="test")
+        squeezy.transition_type = 2  # FADE_IN
+        squeezy.current_sample_rate = 44100
+        squeezy.transition_period_sec = 1
+        squeezy._crossfade_total = 2
+        squeezy._crossfade_pos = 0
+
+        fade_in, fade_out = squeezy._build_fade_curves(2)
+        squeezy._fade_in_gains = fade_in  # [0.0, 0.5]
+        squeezy._fade_out_gains = fade_out
+
+        old_sample_bytes = array.array("h", [1000, 2000]).tobytes()
+        squeezy._crossfade_samples = list(old_sample_bytes)
+
+        new_chunk = array.array("h", [4000, 4000]).tobytes()
+
+        result = squeezy._apply_crossfade(new_chunk)
+        result_samples = array.array("h", result)
+
+        # FADE_IN: gain_out = 0.0, gain_in = [0.0, 0.5]
+        # At position 0: 0 * 1000 + 0.0 * 4000 = 0
+        assert abs(result_samples[0] - 0) < 10
+        # At position 1: 0 * 2000 + 0.5 * 4000 = 2000
+        assert abs(result_samples[1] - 2000) < 10
+
+    def test_crossfade_mixing_fade_out_mode(self):
+        """Fade-out mode (3) applies only fade-out to old track."""
+        squeezy = Squeezy(name="test")
+        squeezy.transition_type = 3  # FADE_OUT
+        squeezy.current_sample_rate = 44100
+        squeezy.transition_period_sec = 1
+        squeezy._crossfade_total = 2
+        squeezy._crossfade_pos = 0
+
+        fade_in, fade_out = squeezy._build_fade_curves(2)  # [0.0, 0.5] and [1.0, 0.5]
+        squeezy._fade_in_gains = fade_in
+        squeezy._fade_out_gains = fade_out
+
+        old_sample_bytes = array.array("h", [2000, 2000]).tobytes()
+        squeezy._crossfade_samples = list(old_sample_bytes)
+
+        new_chunk = array.array("h", [4000, 4000]).tobytes()
+
+        result = squeezy._apply_crossfade(new_chunk)
+        result_samples = array.array("h", result)
+
+        # FADE_OUT: gain_out = [1.0, 0.5], gain_in = 0.0
+        # At position 0: 1.0 * 2000 + 0 * 4000 = 2000
+        assert abs(result_samples[0] - 2000) < 10
+        # At position 1: 0.5 * 2000 + 0 * 4000 = 1000
+        assert abs(result_samples[1] - 1000) < 10
+
+    def test_reset_track_state_clears_crossfade(self):
+        """_reset_track_state() clears crossfade state."""
+        squeezy = Squeezy(name="test")
+        squeezy._crossfade_enabled = True
+        squeezy._crossfade_samples = [1, 2, 3]
+        squeezy._crossfade_pos = 5
+        squeezy._crossfade_total = 100
+        squeezy.output_frames = 100
+
+        squeezy._reset_track_state()
+
+        assert squeezy._crossfade_enabled == False
+        assert squeezy._crossfade_samples == []
+        assert squeezy._crossfade_pos == 0
+        assert squeezy._crossfade_total == 0
+
+    def test_transition_parameters_default_short_packet(self):
+        """Short packet defaults to no transition."""
+        squeezy = Squeezy(name="test")
+        squeezy.sock = Mock()
+
+        # Packet too short to contain transition params
+        msg = bytearray(10)
+        msg[0:4] = b"strm"
+        msg[4] = ord("s")
+        msg[5] = ord("1")
+        msg[6] = ord("m")
+
+        squeezy._handle_strm_start(bytes(msg))
+
+        assert squeezy.transition_type == 0
+        assert squeezy.transition_period_sec == 0

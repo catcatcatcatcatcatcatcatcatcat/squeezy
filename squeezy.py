@@ -414,6 +414,16 @@ class Squeezy:
         self.icy_album = ""
         self.icy_meta_int = 0  # ICY metadata interval in bytes (0 = no metadata)
 
+        # Crossfade / fade parameters (per-track, extracted from strm 's' packet)
+        self._crossfade_enabled = False    # Is crossfade currently active?
+        self._fade_in_gains = None         # Gain curve for fade-in (built on transition)
+        self._fade_out_gains = None        # Gain curve for fade-out (built on transition)
+        self._crossfade_samples = []       # Ring buffer of old track samples at boundary
+        self._crossfade_pos = 0            # Current position in crossfade window
+        self._crossfade_total = 0          # Total fade samples for this crossfade window
+        self.transition_type = 0           # Fade mode: 0=none, 1=crossfade, 2=fade-in, 3=fade-out, 4=in+out
+        self.transition_period_sec = 0     # Fade duration in seconds (from strm 's' packet)
+
         # LMS metadata (from JSON-RPC API query)
         # "requesting..." = query in progress, "" = not queried, actual value = result from LMS
         self.lms_title = ""
@@ -889,6 +899,19 @@ class Squeezy:
             self.replay_gain = replay_gain_raw / 0x10000 if replay_gain_raw else 1.0
         else:
             self.replay_gain = 1.0  # Default if packet too short
+
+        # Extract transition parameters (offsets 13-14) for crossfade support
+        if len(msg) >= 15:
+            transition_period_raw = msg[13]
+            transition_type_raw = msg[14]
+            # Convert ASCII digits to integers (bytes 0x30-0x39 map to 0-9)
+            self.transition_period_sec = transition_period_raw - ord("0") if transition_period_raw >= ord("0") else 0
+            self.transition_type = transition_type_raw - ord("0") if transition_type_raw >= ord("0") else 0
+        else:
+            self.transition_type = 0
+            self.transition_period_sec = 0
+        log.debug("Transition: type=%d period=%ds", self.transition_type, self.transition_period_sec)
+
         server_port = struct.unpack_from(">H", msg, 22)[0]
         server_ip_raw = struct.unpack_from(">I", msg, 24)[0]
         http_header = msg[28:]
@@ -1606,6 +1629,79 @@ class Squeezy:
 
     # --- Audio output ---
 
+    def _build_fade_curves(self, fade_duration_samples):
+        """Build linear gain curves for fade in/out.
+
+        Returns tuple: (fade_in_gains, fade_out_gains)
+        Each is a list of normalized gains [0.0-1.0] for each sample position.
+        fade_in: 0.0 → 1.0 (silent to full)
+        fade_out: 1.0 → 0.0 (full to silent)
+        """
+        if fade_duration_samples <= 0:
+            return None, None
+
+        fade_in = [i / fade_duration_samples for i in range(fade_duration_samples)]
+        fade_out = [1.0 - g for g in fade_in]  # Complementary: 1.0 → 0.0
+
+        return fade_in, fade_out
+
+    def _apply_crossfade(self, new_chunk):
+        """Mix old and new track samples during crossfade window.
+
+        Implements 5 fade modes:
+        - 0: FADE_NONE (immediate switch, no fade)
+        - 1: CROSSFADE (old fades out, new fades in)
+        - 2: FADE_IN (new fades in)
+        - 3: FADE_OUT (old fades out)
+        - 4: FADE_INOUT (both fade simultaneously)
+
+        Returns mixed chunk with old track fading out, new track fading in.
+        """
+        if not self._crossfade_samples:
+            return new_chunk
+
+        old_samples = array.array("h", bytes(self._crossfade_samples[:len(new_chunk)]))
+        new_samples = array.array("h", new_chunk)
+        mixed = array.array("h")
+
+        for i in range(min(len(old_samples), len(new_samples))):
+            # Calculate position in the crossfade window (i is sample index)
+            pos_in_fade = self._crossfade_pos + i
+
+            if pos_in_fade < self._crossfade_total:
+                # Still in fade window — apply gain curves
+                if self.transition_type == 1:  # CROSSFADE
+                    gain_out = self._fade_out_gains[pos_in_fade]
+                    gain_in = self._fade_in_gains[pos_in_fade]
+                elif self.transition_type == 2:  # FADE_IN
+                    gain_out = 0.0
+                    gain_in = self._fade_in_gains[pos_in_fade]
+                elif self.transition_type == 3:  # FADE_OUT
+                    gain_out = self._fade_out_gains[pos_in_fade]
+                    gain_in = 0.0
+                elif self.transition_type == 4:  # FADE_INOUT
+                    gain_out = self._fade_out_gains[pos_in_fade]
+                    gain_in = self._fade_in_gains[pos_in_fade]
+                else:  # FADE_NONE
+                    gain_out = 0.0
+                    gain_in = 1.0
+
+                # Mix: old_sample × gain_out + new_sample × gain_in
+                mixed_sample = int(old_samples[i] * gain_out + new_samples[i] * gain_in)
+                mixed.append(mixed_sample)
+            else:
+                # Crossfade window finished, use new sample only
+                mixed.append(new_samples[i])
+
+        # Update position for next batch of samples
+        self._crossfade_pos += len(new_samples)
+
+        if self._crossfade_pos >= self._crossfade_total:
+            log.debug("Crossfade complete after %d samples", self._crossfade_total)
+            self._crossfade_enabled = False
+
+        return mixed.tobytes()
+
     def _reset_track_state(self):
         """Reset state for a new track (true gapless).
         Called when switching tracks without closing the device."""
@@ -1617,6 +1713,11 @@ class Squeezy:
         self.sent_STMo = False
         self.sent_STMl = False
         self._switching_track = False
+        # Clear crossfade state at track boundary
+        self._crossfade_enabled = False
+        self._crossfade_samples.clear()
+        self._crossfade_pos = 0
+        self._crossfade_total = 0
         log.debug("Track boundary: switching to track #%d at frame %d",
                   self._current_track_id, self._track_start_frames)
 
@@ -1657,8 +1758,30 @@ class Squeezy:
                         self._device_start_time = time.monotonic()
                         self._device_start_frames = self.output_frames
                     self.output_frames += len(chunk) // BYTES_PER_FRAME
+                    # Accumulate tail samples for crossfade while draining
+                    if self.decode_complete and self.transition_type > 0 and self._pending_track:
+                        self._crossfade_samples.extend(chunk)
+                        # Keep only the last N bytes (transition_period worth of audio)
+                        max_bytes = int(self.transition_period_sec * self.current_sample_rate * BYTES_PER_FRAME)
+                        if len(self._crossfade_samples) > max_bytes:
+                            self._crossfade_samples = self._crossfade_samples[-max_bytes:]
                     if len(chunk) < required_bytes:
                         chunk += b"\x00" * (required_bytes - len(chunk))
+
+                    # Crossfade support: Check if we should initialize crossfade
+                    # for this chunk (first chunk of new track after boundary)
+                    if self.transition_type > 0 and not self._crossfade_enabled:
+                        fade_duration_samples = int(self.transition_period_sec * self.current_sample_rate)
+                        if fade_duration_samples > 0 and len(self._crossfade_samples) > 0:
+                            self._crossfade_enabled = True
+                            self._crossfade_total = fade_duration_samples
+                            self._fade_in_gains, self._fade_out_gains = self._build_fade_curves(fade_duration_samples)
+                            log.debug("Starting crossfade: %d samples, type=%d", fade_duration_samples, self.transition_type)
+
+                    # Apply crossfade mixing if active
+                    if self._crossfade_enabled and self._crossfade_pos < self._crossfade_total:
+                        chunk = self._apply_crossfade(chunk)
+
                     # Apply volume scaling: remote control (audg) × replay gain (strm s)
                     # Both are normalized to 1.0 = unity gain
                     vol = self.volume * self.replay_gain
@@ -1682,6 +1805,9 @@ class Squeezy:
                 if self._pending_track:
                     # True gapless: switch to next track without closing device
                     log.debug("Track complete — gapless switch to pending track")
+                    # Crossfade samples were accumulated during playback (above)
+                    if self._crossfade_samples:
+                        log.debug("Crossfade: %d bytes from old track tail", len(self._crossfade_samples))
                     self._send_stat("STMu")  # Send output underrun for current track
                     self._reset_track_state()
                     # Start the new stream (network connection only, device stays open)

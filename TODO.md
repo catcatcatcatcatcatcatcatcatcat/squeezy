@@ -249,14 +249,25 @@ We already do this correctly with `(bytes_received >> 32) & 0xFFFFFFFF` and
 
 ## Priority 2 — User-Facing Quality
 
-**STATUS: 4/5 Complete (Variable SR + Gapless + Replay Gain + ICY Metadata)**
+**STATUS: ✅ 9/11 COMPLETE** (Session 2024-04-04 - comprehensive P2.x feature push)
 
 These features affect the listening experience. Users will notice their absence
 when comparing squeezy to a real Squeezebox or squeezelite.
 
-Recent completions (session 2024-04-04):
+Completed in this session:
 - ✅ **P2.1** True gapless playback (track boundary handling, zero-gap transitions)
+- ✅ **P2.2** Crossfade Support (5 fade modes: NONE, CROSSFADE, FADE_IN, FADE_OUT, FADE_INOUT)
 - ✅ **P2.3** Replay gain (16.16 fixed-point parsing and application)
+- ✅ **P2.4** ICY metadata (Shoutcast radio metadata extraction)
+- ✅ **P2.5** Variable sample rate (44.1k/48k/96k/192k native)
+- ✅ **P2.7** HTTPS/SSL Stream Support (port 443 detection, SSL wrapping, CanHTTPS capability)
+- ✅ **P2.9** Player Name Persistence (save/load to ~/.config/squeezy/)
+- ✅ **P2.10** CONT Metaint Support (extract metaint field for ICY sync)
+- ✅ **P2.11** Codec Priority (ffmpeg decoder probing, dynamic codec reporting)
+
+Deferred/Skipped:
+- ⏸️ **P2.6** 24-bit/32-bit Audio (deferred - requires full refactor, see note below)
+- ⏭️ **P2.8** Hardware Volume (skipped - platform-specific, complex)
 - ✅ **P2.4** ICY metadata (already implemented, verified working)
 - ✅ **P2.5** Variable sample rate (5 commits: detection, state tracking, device switching)
 
@@ -295,32 +306,33 @@ one ends. No audible gap like squeezelite's implementation.
 
 ### 2.2 Crossfade Support
 
+**STATUS: ✅ COMPLETE (commit 69d7f08, with 13 unit tests)**
+
 **Problem:** LMS sends crossfade parameters (fade mode, duration) in the `strm s`
 packet. Without implementing them, transitions are abrupt.
 
-**How squeezelite handles it:**
-`output.c:193-250` — Five fade modes:
-```c
-FADE_NONE = 0, FADE_CROSSFADE, FADE_IN, FADE_OUT, FADE_INOUT
-```
+**Implementation:**
+Extracts transition parameters from `strm s` packet and applies 5 fade modes:
+- 0: FADE_NONE (immediate switch)
+- 1: CROSSFADE (old fades out, new fades in)
+- 2: FADE_IN (new fades in from silence)
+- 3: FADE_OUT (old fades out to silence)
+- 4: FADE_INOUT (both fade simultaneously)
 
-Crossfade uses complementary gain curves:
-```c
-cross_gain_in  = to_gain((float)cur_f / (float)dur_f);
-cross_gain_out = FIXED_ONE - cross_gain_in;
-```
+**Architecture:**
+- Extract transition parameters in `_handle_strm_start()` (offsets 13-14)
+- Build linear gain curves: `_build_fade_curves()` generates 0→1 and 1→0 gains
+- Mix samples in `_apply_crossfade()` at track boundary using gain curves
+- Save end-of-track samples for crossfade at gapless boundary
+- Replay gain applied multiplicatively after crossfade
 
-Old and new track audio is mixed sample-by-sample during the fade period. Separate
-replay gain is maintained for each track during the crossfade.
+**Key Code:**
+- `_build_fade_curves()`: Generate gain curves for fade duration
+- `_apply_crossfade()`: Mix old/new samples with gain curves
+- Sample-by-sample mixing: `old * gain_out + new * gain_in`
+- Complementary gains ensure smooth transitions without pops/clicks
 
-**Where parameters come from:** `strm s` packet fields:
-- `transition_type` (byte at offset 13, minus '0')
-- `transition_period` (byte at offset 14)
-
-**Suggested fix:**
-Store the transition params from `strm s`. When we have gapless (2.1 Phase 2),
-apply a linear crossfade by mixing samples from the old and new track regions of
-the buffer over `transition_period` seconds.
+**Tests:** 13 comprehensive tests covering all fade modes, parameter extraction, gain curves.
 
 ---
 
@@ -400,6 +412,8 @@ resampled by ffmpeg, causing unnecessary CPU usage and quality loss.
 
 ### 2.6 24-bit and 32-bit Audio
 
+**STATUS: ⏸️ DEFERRED (See notes below for future implementation)**
+
 **Problem:** Squeezy uses 16-bit samples internally. Hi-res content (24-bit FLAC,
 32-bit WAV) is downsampled by ffmpeg, losing dynamic range.
 
@@ -408,31 +422,47 @@ resampled by ffmpeg, causing unnecessary CPU usage and quality loss.
 - Output packing converts to device format: S16, S24, S24_3LE, S32
 - `output_pack.c` handles all conversions with gain and clipping protection
 
-**Suggested fix:**
-Phase 1: Keep 16-bit (functional, good enough for most content).
-Phase 2: Switch internal format to 32-bit (or float32). Tell ffmpeg to output
-`-f s32le` instead of `-f s16le`. Update volume scaling to use 32-bit math.
-Update miniaudio device to `SampleFormat.SIGNED32`.
+**Why deferred:**
+P2.6 requires extensive refactoring of the audio pipeline and would benefit from:
+- A dedicated implementation session with focused testing
+- Updates to all audio processing code (generators, volume scaling, crossfade mixing)
+- Full test suite updates (current 41 tests assume 16-bit sample format)
+- Careful validation on multiple platforms
+
+**Future implementation approach:**
+1. Change `BYTES_PER_FRAME` from 4 to 8 (for stereo 32-bit)
+2. Update ffmpeg output: `-f s32le` instead of `-f s16le`
+3. Update miniaudio device format: `SampleFormat.SIGNED32`
+4. Update array types: `array.array("i", ...)` instead of `"h"`
+5. Update all sample processing with 32-bit range clamping
+6. Comprehensive testing on all platforms
+
+**Current status:** 16-bit is sufficient for most content. Premium content requiring hi-res can
+be handled by a dedicated P2.6 implementation session once this session's work is stable.
 
 ---
 
 ### 2.7 HTTPS/SSL Stream Support
 
+**STATUS: ✅ COMPLETE (commit 4fba193)**
+
 **Problem:** Some LMS configurations serve streams over HTTPS (especially with
 reverse proxies or mysqueezebox.com).
 
-**How squeezelite handles it:**
-- `stream.c:110-143` — OpenSSL support with dynamic library loading
-- `slimproto.c:123` — `CanHTTPS=1` capability advertised in HELO
-- SSL connection with fallback: `PR #77` — If SSL fails, retry without SSL
+**Implementation:**
+Automatically detects HTTPS connections and wraps stream socket with SSL/TLS.
 
-**History:** Added in v1.9.2 (PR #65). SSL negotiation via RTMP flag added in
-v1.9.8. OpenSSL 3 compatibility fixed in PR #186.
+**Architecture:**
+- Port 443 detection: Check if `server_port == 443` in `_do_stream()`
+- SSL wrapping: Use `ssl.create_default_context().wrap_socket()` with server hostname
+- Graceful fallback: Log warning if SSL negotiation fails, continue with HTTP
+- Capability advertisement: Add `CanHTTPS=1` to HELO capabilities
 
-**Suggested fix:**
-Python has SSL built-in. When the stream URL uses HTTPS (or LMS signals SSL via
-flags), wrap the stream socket with `ssl.create_default_context().wrap_socket()`.
-Advertise `CanHTTPS=1` in capabilities.
+**Code locations:**
+- `_do_stream()`: SSL wrapping after socket connect (lines 1374-1383)
+- `_capabilities()`: CanHTTPS=1 advertised in HELO string
+
+**Tests:** Functional verification in manual testing (SSL connection to HTTPS streams).
 
 ---
 
@@ -456,77 +486,90 @@ could use `pulsectl` on Linux or `osascript` on macOS to set system volume.
 
 ### 2.9 Player Name Persistence
 
+**STATUS: ✅ COMPLETE (commit 4fba193)**
+
 **Problem:** LMS sends a SETD packet with the player name. If the player restarts,
 the name should be restored without requiring LMS to re-send it.
 
-**How squeezelite handles it:**
-`slimproto.c:450-478` — SETD handler:
-- ID 0, length 5 = query → respond with current name
-- ID 0, length > 5 = set → store in `player_name`, write to file if `-N` flag set
+**Implementation:**
+Saves player name to config file on first update, loads it on startup.
 
-```c
-if (name_file) {
-    FILE *fp = fopen(name_file, "w");
-    fputs(player_name, fp);
-}
-```
+**Architecture:**
+- Config directory: `~/.config/squeezy/` (respects XDG_CONFIG_HOME)
+- Save on update: `_save_player_name()` writes to `~/.config/squeezy/player_name`
+- Load on startup: `_load_player_name()` restores name in `__init__`
+- SETD handler: Updated to call `_save_player_name()` when LMS sends new name
 
-**Suggested fix:**
-Save player name to `~/.config/squeezy/player_name` (or XDG-appropriate path).
-On startup, read it back. In `_handle_setd`, if ID=0 and data present, update
-and persist.
+**Code locations:**
+- `_get_config_dir()`: Returns config directory path (creates if missing)
+- `_load_player_name()`: Load name from file, return None if not found
+- `_save_player_name()`: Write name to file, handle errors gracefully
+- `__init__`: Load saved name as fallback, use LMS-provided name as priority
+- `_handle_setd()`: Save when name is updated
+
+**Tests:** Functional verification (name persistence across restarts).
 
 ---
 
-### 2.10 CONT Packet / Autostart Logic
+### 2.10 CONT Packet / Autostart Logic + Metaint
+
+**STATUS: ✅ COMPLETE (commit 4fba193)**
 
 **Problem:** For `autostart >= 2`, LMS sends a CONT (continuation) packet to signal
-"start playing now". Without handling this, synchronized playback won't work and some
-streams may never start.
+"start playing now". The packet also includes metaint field for ICY metadata synchronization.
 
-**How squeezelite handles it:**
-`slimproto.c:399-415`:
-```c
-static void process_cont(u8_t *pkt, int len) {
-    if (autostart > 1) {
-        autostart -= 2;
-        if (stream.state == STREAMING_WAIT) {
-            stream.state = STREAMING_BUFFERING;
-            stream.meta_interval = stream.meta_next = cont->metaint;
-        }
-    }
-}
-```
+**Implementation:**
+Enhanced CONT handler to extract metaint field and decrement autostart for sync groups.
 
-**Current squeezy status:**
-We handle CONT to set `self.cont_received = True` which gates audio start. Basic
-functionality works but we don't handle the `metaint` field (needed for ICY
-metadata).
+**Architecture:**
+- Autostart handling: Decrement by 2 when `autostart >= 2`
+- Metaint extraction: Parse u32 big-endian value at offset 4 in CONT packet
+- Sync group support: `cont_received` flag gates audio start until CONT arrives
+- ICY sync: Update `icy_meta_int` from CONT packet if present
 
-**Suggested fix:**
-Parse `metaint` from CONT packet and store for ICY metadata support (see 2.4).
+**Code locations:**
+- `_handle_cont()`: Extract metaint (offset 4, u32 big-endian) and update icy_meta_int
+- Sync detection: Check `self.cont_received` before audio start
+- Integration: Works with ICY metadata parser to handle in-stream metadata
+
+**Tests:** Functional verification (sync group playback with metaint synchronization).
 
 ---
 
 ### 2.11 Codec Priority / Complete Format Support
 
+**STATUS: ✅ COMPLETE (commit 4fba193)**
+
 **Problem:** LMS decides what format to send based on the player's reported
 capabilities. If we don't report all supported codecs, LMS may transcode
 unnecessarily (e.g., sending MP3 instead of native FLAC).
 
-**How squeezelite handles it:**
-Codecs are reported in the HELO capabilities string as comma-separated short names.
-The supported list: `mp3, flc, pcm, aif, ogg, aac, wma, alc, dsd, ops` (Opus).
-Each codec can optionally include a priority or supported rates.
+**Implementation:**
+Probes ffmpeg at startup to detect available decoders and reports them in HELO capabilities.
 
-**Suggested fix:**
-Report all codecs that ffmpeg supports. Check for ffmpeg at startup and probe
-available decoders:
+**Architecture:**
+- Startup probing: `_probe_ffmpeg_codecs()` static method runs at initialization
+- Decoder detection: Parse ffmpeg `-decoders` output, map to SlimProto short names
+- Fallback: Use standard codec list if ffmpeg probing fails
+- Dynamic reporting: Codec list built in `_capabilities()` using detected decoders
+
+**Codec mapping:**
 ```python
-result = subprocess.run(["ffmpeg", "-decoders"], capture_output=True, text=True)
-# Parse for flac, mp3, vorbis, aac, alac, opus, wma, pcm_*
+mp3, flac, ogg (vorbis), aac, alac, ops (opus), wma, dsd, pcm
 ```
-Build capabilities accordingly.
+
+**Code locations:**
+- `_probe_ffmpeg_codecs()`: Static method that calls `ffmpeg -decoders` and parses output
+- `_capabilities()`: Builds codec string from detected decoders
+- Error handling: Graceful fallback to standard list if probing fails
+- Logging: Debug output shows detected codec list
+
+**Benefits:**
+- LMS optimizes codec selection without unnecessary transcoding
+- Supports all ffmpeg decoders automatically (extensible)
+- Reduces CPU usage and latency
+
+**Tests:** Functional verification (codec reporting in HELO capabilities).
 
 ---
 

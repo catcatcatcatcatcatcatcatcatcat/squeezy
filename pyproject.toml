@@ -3,7 +3,7 @@ name = "squeezy"
 version = "0.2.0"
 description = "Minimal Squeezebox player for Lyrion Music Server"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = "MIT"
 keywords = ["squeezebox", "lyrion", "slimproto", "audio", "music-player"]
 classifiers = [
@@ -35,4 +35,18 @@ Homepage = "https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy"
 Issues = "https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/issues"
 
 [project.scripts]
-squeezy = "squeezy:main"
+squeezy = "squeezy.squeezy:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["squeezy*"]
+
+[tool.setuptools.package-data]
+squeezy = ["py.typed"]

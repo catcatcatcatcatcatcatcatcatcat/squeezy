@@ -20,20 +20,20 @@ from urllib.request import urlopen
 import miniaudio
 
 # Import Phase 1 modules (foundation)
-from . import slimproto
-from . import config
-from . import metadata
+from .protocol import slimproto
+from .config import config
+from .config import metadata
 
 # Import Phase 2 modules (protocol layer)
-from . import server_connection
-from . import lms_client
+from .network import server_connection
+from .protocol import lms_client
 
 # Import Phase 3 modules (audio & stream pipeline)
-from . import audio_player
-from . import stream_decoder
+from .audio import player as audio_player
+from .audio import stream_decoder
 
 # Import Phase 4 module (message dispatch)
-from . import protocol_handler
+from .protocol import handler as protocol_handler
 
 log = logging.getLogger("squeezy")
 
@@ -190,7 +190,7 @@ class Squeezy:
         self.stream_thread = None
         self.ffmpeg_proc = None
         self.decode_thread = None
-        self.pcm_buf = PCMBuffer()
+        # pcm_buf already initialized above via stream_decoder.PCMBuffer()
         self.streaming = False
         self.stream_bytes = 0
         self.decode_complete = False

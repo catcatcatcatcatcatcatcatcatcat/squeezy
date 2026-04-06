@@ -1,4 +1,4 @@
-.PHONY: install uninstall run test
+.PHONY: install uninstall run dev-run test
 
 install:
 	pipx install .
@@ -9,5 +9,8 @@ uninstall:
 run:
 	squeezy
 
+dev-run:
+	PYTHONPATH=src python -m squeezy
+
 test:
-	pytest tests/ -v --timeout=60
+	PYTHONPATH=src pytest tests/ -v --timeout=60

@@ -5,7 +5,7 @@ Minimal Squeezebox-compatible player for [Lyrion Music Server](https://lyrion.or
 ## Requirements
 
 - macOS, Linux, or Windows
-- Python 3.10+
+- Python 3.9+
 - [ffmpeg](https://ffmpeg.org/)
 
 ## Install
@@ -74,6 +74,25 @@ squeezy --version
 ```
 
 Your player will appear in the Lyrion Music Server web UI. Select it from the player dropdown to start streaming.
+
+## Project Structure
+
+```
+src/squeezy/
+├── squeezy.py          # Main player orchestrator
+├── audio/              # Audio playback & streaming
+│   ├── player.py       # miniaudio device, mixing, crossfade
+│   └── stream_decoder.py # HTTP streaming & FFmpeg
+├── protocol/           # SlimProto protocol & LMS communication
+│   ├── handler.py      # Message dispatch & parsing
+│   ├── slimproto.py    # Protocol constants & packet builders
+│   └── lms_client.py   # LMS message operations
+├── network/            # Network connectivity
+│   └── server_connection.py # Socket management
+└── config/             # Configuration & metadata
+    ├── config.py       # XDG-compliant config
+    └── metadata.py     # ICY metadata parsing
+```
 
 ## Contributing
 

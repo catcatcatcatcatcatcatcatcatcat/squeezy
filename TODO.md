@@ -21,6 +21,50 @@ learned from studying squeezelite's codebase and 530+ commits / 260+ GitHub issu
 
 ---
 
+## Project Structure (src/ Layout)
+
+The codebase is organized into functional subpackages within `src/squeezy/`:
+
+```
+src/squeezy/
+├── squeezy.py                  # Main player orchestrator
+├── audio/
+│   ├── __init__.py
+│   ├── player.py               # AudioPlayer class (miniaudio device)
+│   └── stream_decoder.py       # StreamDecoder & PCMBuffer classes
+├── protocol/
+│   ├── __init__.py
+│   ├── handler.py              # ProtocolHandler class (message dispatch)
+│   ├── slimproto.py            # Protocol constants & packet builders
+│   └── lms_client.py           # LmsClient class (message operations)
+├── network/
+│   ├── __init__.py
+│   └── server_connection.py    # ServerConnection class (socket I/O)
+└── config/
+    ├── __init__.py
+    ├── config.py               # Config management (XDG paths)
+    └── metadata.py             # ICY metadata parsing functions
+```
+
+**Module responsibilities:**
+- **audio/**: Playback device lifecycle, audio mixing, crossfade, elapsed time calculation
+- **protocol/**: SlimProto message parsing, dispatch, codec probing
+- **network/**: TCP/UDP socket management, server discovery
+- **config/**: Configuration persistence, metadata extraction from streams
+- **squeezy.py**: Orchestrates all modules, CLI argument handling, main event loop
+
+When referencing modules in implementation notes, use the new paths:
+- Old: `audio_player.py` → New: `audio/player.py`
+- Old: `stream_decoder.py` → New: `audio/stream_decoder.py`
+- Old: `protocol_handler.py` → New: `protocol/handler.py`
+- Old: `slimproto.py` → New: `protocol/slimproto.py`
+- Old: `lms_client.py` → New: `protocol/lms_client.py`
+- Old: `server_connection.py` → New: `network/server_connection.py`
+- Old: `config.py` → New: `config/config.py`
+- Old: `metadata.py` → New: `config/metadata.py`
+
+---
+
 ## Priority 2 — Deferred/Skipped Features
 
 ### 2.6 24-bit and 32-bit Audio
@@ -169,7 +213,7 @@ Adjust frame boundaries accordingly.
 
 **Suggested fix for squeezy:**
 When FFmpeg detects LAME-encoded MP3:
-- Parse ID3v2 LAME info tag (in stream_decoder or audio_player)
+- Parse ID3v2 LAME info tag (in `audio/stream_decoder.py` or `audio/player.py`)
 - Extract `encoder_delay` and `encoder_padding` from LAME tag
 - Adjust track boundary by `encoder_delay` frames
 - Trim end-of-track by `encoder_padding` frames
@@ -261,7 +305,7 @@ player is registered to two servers.
 `slimproto.c:361-370` — Immediately returns from `slimproto_run()` to trigger reconnection.
 
 **Suggested fix for squeezy:**
-In `protocol_handler.dispatch()`, handle DSCO:
+In `protocol/handler.py` `dispatch()` method, handle DSCO:
 ```python
 elif msg[4:8] == b'DSCO':
     log.info("Received DSCO packet, disconnecting")
@@ -299,7 +343,7 @@ announcements). Without handling this, audio continues playing.
 `slimproto.c:327-339` — Pause/resume playback based on AUDE packet.
 
 **Suggested fix for squeezy:**
-In `protocol_handler.dispatch()`, handle AUDE:
+In `protocol/handler.py` `dispatch()` method, handle AUDE:
 ```python
 elif msg[4:8] == b'AUDE':
     enabled = msg[5] != 0

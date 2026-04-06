@@ -62,7 +62,7 @@ class AudioPlayer:
         log.info("Starting audio playback at %d Hz", self.squeezy.current_sample_rate)
         try:
             # Import constants from squeezy module
-            from . import squeezy as sq_module
+            from .. import squeezy as sq_module
             self.squeezy.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=sq_module.CHANNELS,
@@ -120,7 +120,7 @@ class AudioPlayer:
                 pass
             self.squeezy.device = None
         try:
-            from . import squeezy as sq_module
+            from .. import squeezy as sq_module
             self.squeezy.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=sq_module.CHANNELS,
@@ -143,7 +143,7 @@ class AudioPlayer:
         Returns:
             Milliseconds of audio played (relative to current track)
         """
-        from . import squeezy as sq_module
+        from .. import squeezy as sq_module
 
         # For true gapless, calculate relative to current track
         frames_in_track = self.squeezy.output_frames - self.squeezy._track_start_frames

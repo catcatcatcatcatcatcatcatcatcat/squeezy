@@ -86,7 +86,7 @@ class ProtocolHandler:
             if len(msg) >= 22:
                 target_jiffies = struct.unpack_from(">I", msg, 18)[0]
             self.squeezy.start_at_jiffies = target_jiffies
-            import slimproto
+            from . import slimproto
             log.debug("Unpause at: %d now: %d", target_jiffies, slimproto.gettime_ms())
             if self.squeezy.paused:
                 self.squeezy.paused = False
@@ -110,7 +110,7 @@ class ProtocolHandler:
         elif subcommand == "a":
             # Skip ahead — replay_gain field = milliseconds to skip
             if len(msg) >= 22:
-                import squeezy as sq_module
+                from .. import squeezy as sq_module
                 skip_ms = struct.unpack_from(">I", msg, 18)[0]
                 skip_frames = int(skip_ms * self.squeezy.current_sample_rate / 1000)
                 skip_bytes = skip_frames * sq_module.BYTES_PER_FRAME
@@ -256,14 +256,14 @@ class ProtocolHandler:
                 if new_name:
                     self.squeezy.name = new_name
                     try:
-                        import config
-                        config.save_player_name(new_name)
+                        from ..config import config as config_module
+                        config_module.save_player_name(new_name)
                     except Exception as e:
                         log.warning("Failed to save player name: %s", e)
                     log.info("Player name set to: %s", self.squeezy.name)
             # Always respond with current name (matches squeezelite)
             name_data = self.squeezy.name.encode("utf-8") + b"\x00"
-            import slimproto
+            from . import slimproto
             self.squeezy._send(slimproto.build_setd(0, name_data))
 
     def handle_aude(self, msg):

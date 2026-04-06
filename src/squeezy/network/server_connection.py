@@ -28,7 +28,7 @@ class ServerConnection:
         self._send_lock = threading.Lock()
 
     @staticmethod
-    def discover_lms(port: int = 3483) -> str | None:
+    def discover_lms(port: int = 3483) -> str:
         """Discover LMS via UDP broadcast.
 
         Sends "e" probe on port 3483 and listens for "E" response with server IP.
@@ -121,7 +121,7 @@ class ServerConnection:
             except OSError as e:
                 log.warning("Send error: %s", e)
 
-    def recv(self, bufsize: int = 4096) -> bytes | None:
+    def recv(self, bufsize: int = 4096) -> bytes:
         """Receive data from server with timeout handling.
 
         Args:

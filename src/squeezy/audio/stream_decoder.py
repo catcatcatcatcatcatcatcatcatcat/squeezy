@@ -145,7 +145,7 @@ class StreamDecoder:
             self.squeezy.streaming = False
             self._cleanup_ffmpeg()
             try:
-                import slimproto
+                from ..protocol import slimproto
                 self.squeezy._send(slimproto.build_dsco(0))
             except Exception:
                 pass
@@ -201,12 +201,12 @@ class StreamDecoder:
             pass
 
         # Send RESP and STMc packets to LMS
-        import slimproto
+        from ..protocol import slimproto
         self.squeezy._send(slimproto.build_resp(resp_headers))
         self.squeezy._send_stat("STMc")
 
         # For raw PCM at native format, skip ffmpeg entirely
-        import squeezy as sq_module
+        from .. import squeezy as sq_module
         pcm_passthrough = (fmt == "p" and pcm_info
                            and pcm_info["bits"] == 16 and pcm_info["endian"] == "le"
                            and pcm_info["rate"] == sq_module.SAMPLE_RATE
@@ -286,7 +286,7 @@ class StreamDecoder:
                             if meta_len > 0:
                                 meta_data = self.squeezy.stream_sock.recv(meta_len)
                                 if meta_data:
-                                    import metadata
+                                    from ..config import metadata
                                     result = metadata.parse_icy_metadata(meta_len_byte + meta_data)
                                     if result["title"]:
                                         log.info("Track: %s (from ICY metadata)", result["title"])

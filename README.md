@@ -43,6 +43,12 @@ source .venv/bin/activate
 pip install .
 ```
 
+For development (run directly without installing):
+
+```bash
+./run.sh -n "My Speaker" -vv
+```
+
 Squeezy checks for updates on startup and will notify you when a new version is available.
 
 ## Usage

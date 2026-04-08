@@ -162,10 +162,13 @@ class Squeezy:
         """Save player name to config file."""
         config.save_player_name(name)
 
-    def __init__(self, name="Squeezy", server=None, mac=None, device_id=None, latency_msec=None):
-        # Try to load saved player name, fall back to provided name
-        saved_name = self._load_player_name()
-        self.name = saved_name if saved_name else name
+    def __init__(self, name=None, server=None, mac=None, device_id=None, latency_msec=None):
+        # CLI name always wins; otherwise use saved name; otherwise default
+        if name:
+            self.name = name
+        else:
+            saved_name = self._load_player_name()
+            self.name = saved_name if saved_name else "Squeezy"
         self.server_ip = server
         self.mac = mac_from_string(mac) if mac else default_mac()
         self.audio_device_id = device_id
@@ -1928,7 +1931,7 @@ def check_for_update():
 def main():
     parser = argparse.ArgumentParser(description="Squeezy - Minimal Squeezebox player")
     parser.add_argument("-s", "--server", help="LMS server IP (auto-discover if not set)")
-    parser.add_argument("-n", "--name", default="Squeezy", help="Player name (default: Squeezy)")
+    parser.add_argument("-n", "--name", default=None, help="Player name (default: saved name or 'Squeezy')")
     parser.add_argument("-m", "--mac", help="MAC address aa:bb:cc:dd:ee:ff (auto-detect if not set)")
     parser.add_argument("-d", "--device", help="Audio output device (name or substring, e.g. 'HDMI')")
     parser.add_argument("-l", "--list-devices", action="store_true", help="List audio output devices and exit")

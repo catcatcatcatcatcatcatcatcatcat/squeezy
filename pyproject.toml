@@ -1,6 +1,6 @@
 [project]
 name = "squeezy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Minimal Squeezebox player for Lyrion Music Server"
 readme = "README.md"
 requires-python = ">=3.9"

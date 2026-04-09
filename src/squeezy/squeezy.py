@@ -189,18 +189,27 @@ class Squeezy:
 
 
         # Stream state
+        # Thread safety note: stream_sock, ffmpeg_proc are written by main thread
+        # (in _stop_playback) and read/written by stream thread. Protected by the
+        # fact that _stop_playback joins the stream thread before modifying them.
         self.stream_sock = None
         self.stream_thread = None
         self.ffmpeg_proc = None
         self.decode_thread = None
         # pcm_buf already initialized above via stream_decoder.PCMBuffer()
-        self.streaming = False
+        # (has its own internal lock for thread-safe read/write/flush)
+        self.streaming = False          # Written by main+stream threads; bool assignment is atomic in CPython
         self.stream_bytes = 0
-        self.decode_complete = False
+        self.decode_complete = False    # Written by stream/decode thread, read by audio generator
         self.autostart = 0
         self.cont_received = False  # For autostart >= 2
 
         # Audio state
+        # Thread safety: playing/paused are written by main thread (handlers),
+        # read by audio generator (miniaudio callback thread). Bool assignment
+        # is atomic in CPython (GIL). The critical invariant is that
+        # self.playing = True MUST be set BEFORE device.start(gen) because
+        # on Linux the callback fires immediately.
         self.device = None
         self.playing = False
         self.paused = False
@@ -238,6 +247,9 @@ class Squeezy:
         self._current_track_id = 0  # Incremented for each new track
         self._track_start_frames = 0  # output_frames value when current track started
         self._switching_track = False  # Flag: generator should switch to pending track
+
+        # MP3 gapless metadata (LAME encoder delay/padding, parsed by stream_decoder)
+        self.lame_gapless = None  # dict with enc_delay, enc_padding, total_samples or None
 
         # Status reporting — track metadata and playback info for socket
         # ICY metadata (from in-stream headers, for radio/Shoutcast)
@@ -478,45 +490,30 @@ class Squeezy:
         return f"{minutes}:{seconds:02d}"
 
     def _elapsed_ms(self):
-        """Frame-based elapsed time with dynamic device delay compensation.
+        """Frame-based elapsed time with static device delay compensation.
 
-        Like squeezelite's snd_pcm_delay() approach (slimproto.c:163-166):
-        subtract the actual buffer occupancy so LMS knows what the user
+        Like squeezelite's approach (slimproto.c:163-166): subtract the
+        device buffer depth from frames_played so LMS knows what the user
         *hears*, not what we've fed to the audio device.
 
-        We derive buffer depth from wall clock time:
-            buffer = frames_yielded - (wall_time_elapsed * sample_rate)
-
-        This is equivalent to querying the hardware buffer directly —
-        if we've yielded 500ms of audio and 460ms of wall time has passed,
-        there's 40ms still sitting in the device buffer.
+        We use a fixed delay estimate (DEVICE_BUFFER_MSEC + pipeline_latency)
+        rather than a dynamic wall-clock measurement, because the dynamic
+        approach introduces jitter of 10-50ms per heartbeat. That jitter
+        triggers LMS's sync adjustment logic, causing audible skips in
+        synchronized playback. A fixed offset is more stable — squeezelite
+        gets stable values from snd_pcm_delay(), but miniaudio doesn't
+        expose hardware buffer depth, so a fixed estimate is our best option.
 
         For gapless: elapsed time is relative to current track boundary
         (output_frames since current track started).
-
-        Falls back to the static DEVICE_DELAY_MSEC constant until we have
-        enough data to measure dynamically (first real audio frame).
         """
         # For true gapless, calculate relative to current track
         frames_in_track = self.output_frames - self._track_start_frames
         if frames_in_track <= 0:
             return 0
 
-        if self._device_start_time is None:
-            # Not yet playing real audio — use static estimate
-            device_delay_frames = self.current_sample_rate * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
-        else:
-            # Dynamic miniaudio buffer depth: frames yielded minus frames played
-            # (equivalent to snd_pcm_delay() for the miniaudio layer)
-            frames_since = frames_in_track - (self._device_start_frames - self._track_start_frames)
-            ms_since = (time.monotonic() - self._device_start_time) * 1000
-            buffer_ms = frames_since * 1000 / self.current_sample_rate - ms_since
-            # Clamp to sane range
-            buffer_ms = max(0.0, min(buffer_ms, DEVICE_BUFFER_MSEC * 2))
-            # Add the OS pipeline below miniaudio (CoreAudio/ALSA/WASAPI layer)
-            # that snd_pcm_delay() would include but we can't query directly
-            total_delay_ms = buffer_ms + self.pipeline_latency_msec
-            device_delay_frames = int(total_delay_ms * self.current_sample_rate / 1000)
+        # Fixed device delay: miniaudio buffer + OS audio pipeline
+        device_delay_frames = self.current_sample_rate * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
 
         frames = max(0, frames_in_track - device_delay_frames)
         return int(frames * 1000 / self.current_sample_rate)
@@ -548,35 +545,65 @@ class Squeezy:
 
     # --- Message loop ---
 
+    def _run_cleanup(self):
+        """Run _stop_playback in a background thread so the main thread
+        stays in Python code and can handle signals (Ctrl+C).
+
+        C extension calls like device.close() block signal delivery
+        because Python only runs signal handlers between bytecodes.
+        """
+        cleanup = threading.Thread(target=self._stop_playback, daemon=True)
+        cleanup.start()
+        while cleanup.is_alive():
+            cleanup.join(timeout=0.2)
+
     def run(self):
         self.running = True
-        while self.running:
-            if not self.connect():
-                self._failed_connect_count += 1
-                # After 5 consecutive failures, fall back to UDP discovery
-                if self._failed_connect_count >= 5:
-                    log.info("Failed to connect to %s 5 times — falling back to UDP discovery",
-                             self.server_ip or "server")
-                    self.server_ip = None
-                    self._failed_connect_count = 0
-                log.info("Retrying in 5 seconds...")
-                time.sleep(5)
-                continue
-            # Success — reset failure counter
-            self._failed_connect_count = 0
-            try:
-                self._message_loop()
-            except Exception as e:
-                log.warning("Connection lost: %s", e)
-            finally:
-                self._stop_playback()
+        try:
+            while self.running:
+                if not self.connect():
+                    self._failed_connect_count += 1
+                    if self._failed_connect_count >= 5:
+                        log.info("Failed to connect to %s 5 times — falling back to UDP discovery",
+                                 self.server_ip or "server")
+                        self.server_ip = None
+                        self._failed_connect_count = 0
+                    log.info("Retrying in 5 seconds...")
+                    for _ in range(50):
+                        if not self.running:
+                            break
+                        time.sleep(0.1)
+                    continue
+                self._failed_connect_count = 0
+                try:
+                    self._message_loop()
+                except Exception as e:
+                    if self.running:
+                        log.warning("Connection lost: %s", e)
+                finally:
+                    self._run_cleanup()
+                    if self.sock:
+                        try:
+                            self.sock.close()
+                        except OSError:
+                            pass
+                        self.sock = None
+                if self.running:
+                    log.info("Reconnecting in 2 seconds...")
+                    for _ in range(20):
+                        if not self.running:
+                            break
+                        time.sleep(0.1)
+        finally:
+            # Final cleanup — ensure everything is stopped
+            self._run_cleanup()
+            if self.sock:
                 try:
                     self.sock.close()
                 except OSError:
                     pass
-            if self.running:
-                log.info("Reconnecting in 2 seconds...")
-                time.sleep(2)
+                self.sock = None
+            log.info("Shutdown complete")
 
     def _message_loop(self):
         # LMS sends messages in a simple framing protocol:
@@ -608,6 +635,8 @@ class Squeezy:
                 last_status = now
 
             try:
+                if not self.sock:
+                    return  # Socket closed by stop()
                 data = self.sock.recv(4096)
                 if not data:
                     log.info("Server closed connection")
@@ -623,6 +652,10 @@ class Squeezy:
                     log.info("No messages from server for %.0fs — connection dead, reconnecting", elapsed)
                     return
                 continue
+            except OSError:
+                if not self.running:
+                    return  # Socket closed by stop() during shutdown
+                raise
 
             # Parse all complete messages out of the accumulation buffer
             while True:
@@ -1197,18 +1230,21 @@ class Squeezy:
         try:
             self._do_stream(server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info)
         except Exception as e:
-            log.warning("Stream error: %s", e)
+            if self.streaming:
+                log.warning("Stream error: %s", e)
         finally:
-            # Wait for decode reader to finish reading ffmpeg output
-            # (don't kill ffmpeg — let it close naturally after stdin is closed)
+            # Wait for decode reader to finish — but only briefly.
+            # _stop_playback() kills ffmpeg and closes the buffer first,
+            # so the decode thread should exit quickly.
             if self.decode_thread and self.decode_thread.is_alive():
-                self.decode_thread.join(timeout=10)
+                self.decode_thread.join(timeout=2)
             self.streaming = False
             self._cleanup_ffmpeg()
-            try:
-                self._send(build_dsco(0))
-            except Exception:
-                pass
+            if self.running:
+                try:
+                    self._send(build_dsco(0))
+                except Exception:
+                    pass
 
     def _do_stream(self, server_ip, server_port, http_header, threshold, autostart, fmt="?", pcm_info=None):
         # Connect to stream server
@@ -1546,6 +1582,14 @@ class Squeezy:
                 pass
             try:
                 self.ffmpeg_proc.kill()
+            except Exception:
+                pass
+            # Close stdout to unblock any thread blocked on stdout.read()
+            try:
+                self.ffmpeg_proc.stdout.close()
+            except Exception:
+                pass
+            try:
                 self.ffmpeg_proc.wait(timeout=2)
             except Exception:
                 pass
@@ -1717,7 +1761,9 @@ class Squeezy:
                     required_frames = yield chunk
                     continue
 
-            # Buffer empty
+            # Buffer empty — bail immediately during shutdown
+            if not self.running:
+                break
             if self.decode_complete and avail == 0:
                 # Send STMd once when buffer is fully drained (not when decode
                 # finishes). Sending early causes LMS to send the next strm-s
@@ -1821,6 +1867,13 @@ class Squeezy:
             except Exception:
                 pass
             self.device = None
+        # Reset dynamic delay tracking — the old wall-clock reference is stale
+        # after pause. Without this, _elapsed_ms() over-reports because
+        # ms_since (wall time since old device start) is much larger than
+        # frames_since (frames yielded by new generator), making buffer_ms
+        # negative (clamped to 0) and device_delay_frames too small.
+        self._device_start_time = None
+        self._device_start_frames = self.output_frames
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
@@ -1841,43 +1894,76 @@ class Squeezy:
         self.paused = False
         self.output_frames = 0
         self.decode_complete = False
-        self._pending_track = None       # Clear any queued track
-        self._device_start_time = None   # Reset dynamic delay tracking
+        self._pending_track = None
+        self._device_start_time = None
         self._device_start_frames = 0
 
-        # Close stream socket to unblock any pending recv
+        # Unblock writers FIRST — the decode thread may be blocked on
+        # pcm_buf.write() with the buffer full and no reader consuming.
+        self.pcm_buf.close()
+
+        # Close stream socket EARLY to unblock stream thread's recv()
         if self.stream_sock:
+            try:
+                self.stream_sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             try:
                 self.stream_sock.close()
             except Exception:
                 pass
             self.stream_sock = None
 
-        # Wait for stream thread to finish so it doesn't interfere with a new stream
-        if self.stream_thread and self.stream_thread.is_alive():
-            self.stream_thread.join(timeout=5)
-        self.stream_thread = None
-        self.decode_thread = None
-        self.cont_received = False
-        self.sent_STMd = False
-        self.sent_STMu = False
-        self.sent_STMo = False
-        self.sent_STMl = False
+        # Kill ffmpeg and close its stdout — unblocks decode thread's
+        # ffmpeg.stdout.read() and stream thread's stdin.write()
+        self._cleanup_ffmpeg()
 
+        # Wait for decode thread FIRST (it should be unblocked now)
+        if self.decode_thread and self.decode_thread.is_alive():
+            self.decode_thread.join(timeout=2)
+        self.decode_thread = None
+
+        # Wait for stream thread (it also joins decode thread, but it's already done)
+        if self.stream_thread and self.stream_thread.is_alive():
+            self.stream_thread.join(timeout=2)
+        self.stream_thread = None
+
+        # Stop the audio device LAST — the generator checks self.running and
+        # exits immediately during shutdown (no complex cleanup).
+        # All other threads are stopped so no lock contention on pcm_buf.
         if self.device:
             try:
                 self.device.close()
             except Exception:
                 pass
             self.device = None
+        self.cont_received = False
+        self.sent_STMd = False
+        self.sent_STMu = False
+        self.sent_STMo = False
+        self.sent_STMl = False
 
-        self._cleanup_ffmpeg()
         self.pcm_buf.flush()
 
     def stop(self):
+        """Signal the player to shut down.
+
+        Called from signal handler — must be safe to run mid-recv().
+        Only sets the flag and closes the socket to unblock recv().
+        Actual cleanup happens in run()'s finally block.
+        """
+        if not self.running:
+            return
         log.info("Shutting down...")
         self.running = False
-        self._stop_playback()
+        # Close the TCP socket to unblock _message_loop's recv() immediately.
+        # This causes recv() to raise an exception, which exits _message_loop,
+        # and run()'s finally block handles the full cleanup.
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
 
 def list_audio_devices():
@@ -1978,6 +2064,10 @@ def main():
                      device_id=device_id, latency_msec=args.latency)
 
     def handle_signal(sig, frame):
+        if not player.running:
+            # Second signal — force exit immediately
+            import os
+            os._exit(1)
         player.stop()
 
     signal.signal(signal.SIGINT, handle_signal)

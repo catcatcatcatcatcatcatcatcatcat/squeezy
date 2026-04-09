@@ -10,7 +10,24 @@ or this codebase.
 
 ```
 squeezy/
-├── squeezy.py              ← the entire player (one file)
+├── src/squeezy/                ← the player (modular package)
+│   ├── squeezy.py              ← main orchestrator (~1,990 lines)
+│   ├── __init__.py             ← package marker
+│   ├── __main__.py             ← enables `python -m squeezy`
+│   ├── audio/
+│   │   ├── player.py           ← miniaudio device, mixing, crossfade
+│   │   └── stream_decoder.py   ← HTTP streaming, FFmpeg, PCMBuffer
+│   ├── protocol/
+│   │   ├── handler.py          ← message dispatch (strm, cont, audg, serv, aude)
+│   │   ├── slimproto.py        ← protocol constants & packet builders
+│   │   └── lms_client.py       ← LMS message operations (HELO, STAT, DSCO)
+│   ├── network/
+│   │   └── server_connection.py ← TCP/UDP socket management, discovery
+│   └── config/
+│       ├── config.py           ← XDG-compliant config persistence
+│       └── metadata.py         ← ICY metadata parsing
+│
+├── run.sh                  ← dev runner (no install needed)
 ├── pyproject.toml          ← single source of truth: version, deps, metadata
 ├── Makefile                ← shortcuts for common dev tasks
 ├── Dockerfile              ← Linux test environment
@@ -20,7 +37,9 @@ squeezy/
 │
 ├── tests/                  ← automated tests
 │   ├── conftest.py
-│   ├── test_integration.py
+│   ├── test_p1_reliability.py  ← 14 unit tests (connection, heartbeat, state)
+│   ├── test_p2_features.py     ← 41 unit tests (gapless, crossfade, gain, ICY)
+│   ├── test_integration.py     ← 14 integration tests (needs LMS + ffmpeg)
 │   ├── lms_client.py
 │   └── linux_distro_test.sh
 │
@@ -38,18 +57,31 @@ squeezy/
 
 ## Source files
 
-### `squeezy.py`
+### Module structure
 
-The entire player in a single file (~1000 lines). No separate modules, no
-packages — intentionally minimal.
+The codebase is organized into 8 focused modules with clear layer dependencies:
 
-Key sections inside it:
+| Module | Lines | Responsibility |
+|--------|-------|---------------|
+| `protocol/slimproto.py` | 278 | Protocol constants, packet builders, format strings |
+| `config/config.py` | 69 | XDG config directory, player name persistence |
+| `config/metadata.py` | 89 | ICY/Shoutcast metadata parsing |
+| `network/server_connection.py` | 139 | TCP connection, UDP discovery |
+| `protocol/lms_client.py` | 122 | SlimProto message sending (HELO, STAT, DSCO) |
+| `protocol/handler.py` | 299 | Message dispatch & parameter extraction |
+| `audio/player.py` | 285 | miniaudio device, crossfade, gain, elapsed time |
+| `audio/stream_decoder.py` | 450 | HTTP fetch, FFmpeg subprocess, PCMBuffer |
+| `squeezy.py` | ~1,990 | Main orchestrator, CLI, main loop, state management |
+
+### `squeezy.py` — Main orchestrator
+
+The central coordinator (~1,990 lines). Imports and wires together all modules.
+
+Key sections:
 
 | Section | What it does |
 |---------|-------------|
-| Constants (top) | `SAMPLE_RATE`, `CHANNELS`, `DEVICE_BUFFER_MSEC`, `PLATFORM_PIPELINE_MSEC` — audio and timing constants |
-| `build_*` functions | Construct SlimProto binary packets (HELO, STAT, RESP, DSCO, …) |
-| `class PCMBuffer` | Thread-safe byte buffer between stream/decode threads and the audio generator |
+| Constants (top) | Re-exports from `slimproto`: `SAMPLE_RATE`, `CHANNELS`, `DEVICE_BUFFER_MSEC`, etc. |
 | `class Squeezy` | The player — connects to LMS, handles all protocol messages, drives audio |
 | `_handle_strm_*` | Handlers for the `strm` command family (start, stop, pause, flush, skip) |
 | `_stream_worker` / `_do_stream` | Downloads the HTTP audio stream in a background thread |
@@ -74,7 +106,7 @@ Things defined here:
 - **`dependencies`** — runtime requirements (`miniaudio`). Add new deps here.
 - **`[project.optional-dependencies] test`** — test-only deps (`pytest`,
   `pytest-timeout`). Installed with `pip install ".[test]"`.
-- **`[project.scripts]`** — declares `squeezy = "squeezy:main"`, which is what
+- **`[project.scripts]`** — declares `squeezy = "squeezy.squeezy:main"`, which is what
   makes the `squeezy` command available after install.
 - **classifiers** — tells PyPI the supported OSes and Python versions. Update
   when we add/drop support.
@@ -82,7 +114,17 @@ Things defined here:
 
 > **Releasing a new version:** bump `version` in `pyproject.toml`, commit,
 > tag (`git tag v0.x.y`), push. Then `python -m build && twine upload dist/*`.
-> See the release process section in `README.md`.
+
+### `run.sh`
+
+Development runner script. Runs squeezy directly from source without installing:
+
+```bash
+./run.sh -n "My Speaker" -vv
+```
+
+Equivalent to `PYTHONPATH=src python3 -m squeezy "$@"`. Changes to any source
+file take effect immediately on next run — no reinstall needed.
 
 ### `Makefile`
 
@@ -92,7 +134,8 @@ Shortcuts so you don't have to remember exact commands:
 make install    # pipx install . (installs from local source)
 make uninstall  # pipx uninstall squeezy
 make run        # squeezy (run the installed command)
-make test       # pytest tests/ -v --timeout=60
+make dev-run    # PYTHONPATH=src python -m squeezy (run from source)
+make test       # PYTHONPATH=src pytest tests/ -v --timeout=60
 ```
 
 These are convenience wrappers — nothing here that isn't just a shell command.
@@ -122,6 +165,28 @@ docker run --rm --network container:squeezy-lms squeezy-dev \
 
 ## Tests
 
+### `tests/test_p1_reliability.py`
+
+14 unit tests covering Priority 1 (Critical Reliability):
+- Connection management, heartbeat, state transitions
+- STAT packet format, HELO encoding
+- No external dependencies needed
+
+### `tests/test_p2_features.py`
+
+41 unit tests covering Priority 2 (User-Facing Quality):
+- Gapless playback, crossfade mixing, replay gain
+- ICY metadata parsing, variable sample rate
+- Codec priority, player name persistence
+
+### `tests/test_p3_robustness.py`
+
+18 unit tests covering Priority 3 (Robustness & Edge Cases):
+- MP3 gapless (LAME header parsing)
+- PCMBuffer memory limits (OOM prevention)
+- DSCO disconnect packet handling
+- Graceful shutdown
+
 ### `tests/conftest.py`
 
 Pytest fixtures shared across all tests. Handles:
@@ -132,7 +197,7 @@ Pytest fixtures shared across all tests. Handles:
 
 ### `tests/test_integration.py`
 
-The integration test suite. Each test starts a real squeezy process, connects
+14 integration tests. Each test starts a real squeezy process, connects
 it to a real LMS instance (running in Docker), and verifies behaviour:
 - Player registers with LMS
 - Playback starts and elapsed time advances
@@ -191,13 +256,6 @@ Created automatically by pip when you run `pip install -e .` or `pip install .`
 from the repo directory. It's pip's bookkeeping folder — a cache of the package
 metadata derived from `pyproject.toml`.
 
-Contains:
-- `PKG-INFO` — the rendered package description
-- `SOURCES.txt` — list of files pip knows about
-- `requires.txt` — dependencies
-- `entry_points.txt` — the `squeezy = squeezy:main` script mapping
-- `top_level.txt` — which Python modules belong to this package (`squeezy`)
-
 **You never edit these files** — they're regenerated every time you install.
 The `.gitignore` excludes `*.egg-info/` so they don't get committed. If they
 get out of sync or cause weird import errors, just delete the folder and
@@ -210,15 +268,12 @@ to PyPI:
 - `squeezy-X.Y.Z.tar.gz` — source distribution (sdist)
 - `squeezy-X.Y.Z-py3-none-any.whl` — wheel (the faster-to-install binary-ish format)
 
-The `py3-none-any` in the wheel name means: Python 3, no compiled C extension,
-any platform — so one wheel works everywhere. Delete `dist/` before building
-a new release to avoid uploading stale files.
+Delete `dist/` before building a new release to avoid uploading stale files.
 
 ### `build/`
 
 Scratch space used by `python -m build` during the wheel/sdist build process.
-`build/lib/` contains a copy of `squeezy.py` as it would appear inside the
-wheel. Safe to delete any time.
+Safe to delete any time.
 
 ### `.venv/`
 
@@ -254,7 +309,7 @@ be committed.
 ## How to set up a dev environment
 
 ```bash
-git clone https://github.com/yourname/squeezy
+git clone https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy.git
 cd squeezy
 
 # Create and activate a virtual environment
@@ -262,27 +317,25 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install squeezy + test dependencies in editable mode
-# Editable (-e) means changes to squeezy.py take effect immediately
 pip install -e ".[test]"
 
 # Verify it works
 squeezy --help
 squeezy --version
 
-# Run the test suite (needs LMS running — see tests/conftest.py)
-pytest tests/ -v --timeout=60
-# or
+# Quick dev run (no install needed after code changes):
+./run.sh -n "My Speaker" -vv
+
+# Run the test suite
 make test
+# or: PYTHONPATH=src pytest tests/ -v --timeout=60
 ```
 
 ## How to release a new version
 
 1. Update `version` in `pyproject.toml`
-2. Update `CHANGELOG` / release notes if you have them
-3. Commit: `git commit -am "chore: bump version to X.Y.Z"`
-4. Tag: `git tag vX.Y.Z && git push --tags`
-5. Build: `rm -rf dist/ build/ && python -m build`
-6. Upload: `twine upload dist/*`
-7. Update Homebrew tap formula with new version + SHA256
-
-Full release instructions are in `README.md`.
+2. Commit: `git commit -am "chore: bump version to X.Y.Z"`
+3. Tag: `git tag vX.Y.Z && git push && git push --tags`
+4. Build: `rm -rf dist/ build/ && python -m build`
+5. Upload: `twine upload dist/*`
+6. Update Homebrew tap formula with new version + SHA256

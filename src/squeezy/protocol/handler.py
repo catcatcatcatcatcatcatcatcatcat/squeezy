@@ -46,6 +46,8 @@ class ProtocolHandler:
             self.handle_cont(msg)
         elif opcode == b"serv":
             self.handle_serv(msg)
+        elif opcode == b"dsco":
+            self.handle_dsco(msg)
         else:
             log.debug("Unknown opcode: %s", opcode)
 
@@ -297,3 +299,21 @@ class ProtocolHandler:
         if new_server_ip_raw:
             self.squeezy.server_ip = socket.inet_ntoa(struct.pack(">I", new_server_ip_raw))
             log.info("Server redirect to %s", self.squeezy.server_ip)
+
+    def handle_dsco(self, msg):
+        """Handle DSCO message — server-initiated disconnect.
+
+        LMS sends this during server maintenance or when a player is
+        registered to two servers. We stop playback and trigger reconnection
+        by returning from the message loop (squeezelite does the same in
+        slimproto.c:361-370).
+        """
+        log.info("Server sent DSCO — disconnecting for reconnect")
+        self.squeezy._stop_playback()
+        # Close socket to break out of _message_loop recv()
+        if self.squeezy.sock:
+            try:
+                self.squeezy.sock.close()
+            except Exception:
+                pass
+            self.squeezy.sock = None

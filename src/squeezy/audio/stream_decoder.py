@@ -23,24 +23,65 @@ class PCMBuffer:
     - Writer (stream thread): downloads and decodes audio, calls .write()
     - Reader (miniaudio callback): audio generator, calls .read()
     - Control (main thread): calls .flush() on stop/skip
+
+    Memory is bounded: writes block when the buffer is full, applying
+    backpressure to the upstream decoder (ffmpeg). This prevents OOM
+    while ensuring no audio data is lost.
     """
 
-    def __init__(self):
-        """Initialize empty buffer."""
+    # Default max buffer: ~23 seconds at 44100Hz stereo 16-bit (4 MB)
+    MAX_SIZE = 4 * 1024 * 1024
+
+    def __init__(self, max_size=None):
+        """Initialize empty buffer.
+
+        Args:
+            max_size: Maximum buffer size in bytes (default: 4MB).
+                      Set to 0 for unlimited (testing only).
+        """
         self.buf = bytearray()
         self.lock = threading.Lock()
+        self._not_full = threading.Condition(self.lock)
+        self.max_size = max_size if max_size is not None else self.MAX_SIZE
+        self._closed = False
 
     def write(self, data):
-        """Append data to buffer (thread-safe).
+        """Append data to buffer, blocking until all data is written.
+
+        Blocks in a loop until the entire chunk is consumed. This applies
+        backpressure to ffmpeg via its stdout pipe — ffmpeg blocks on write
+        when the pipe is full, which happens when we stop reading because
+        our buffer is full.
 
         Args:
             data: Bytes to append
+
+        Returns:
+            Number of bytes actually written (0 if closed before any write)
         """
-        with self.lock:
-            self.buf.extend(data)
+        if not self.max_size:
+            with self._not_full:
+                self.buf.extend(data)
+                return len(data)
+        offset = 0
+        total = len(data)
+        with self._not_full:
+            while offset < total:
+                # Wait for space
+                while len(self.buf) >= self.max_size and not self._closed:
+                    self._not_full.wait(timeout=0.1)
+                if self._closed:
+                    return offset
+                space = self.max_size - len(self.buf)
+                end = min(offset + space, total)
+                self.buf.extend(data[offset:end])
+                offset = end
+        return offset
 
     def read(self, n):
         """Read and remove n bytes from buffer (thread-safe).
+
+        Wakes any blocked writers after freeing space.
 
         Args:
             n: Number of bytes to read
@@ -48,9 +89,11 @@ class PCMBuffer:
         Returns:
             Bytes read (may be less than n if buffer has less)
         """
-        with self.lock:
+        with self._not_full:
             chunk = bytes(self.buf[:n])
             del self.buf[:n]
+            if chunk:
+                self._not_full.notify()
             return chunk
 
     def available(self):
@@ -71,15 +114,25 @@ class PCMBuffer:
         Returns:
             Bytes actually skipped
         """
-        with self.lock:
+        with self._not_full:
             skipped = min(n, len(self.buf))
             del self.buf[:skipped]
+            if skipped:
+                self._not_full.notify()
             return skipped
 
     def flush(self):
-        """Clear entire buffer (thread-safe)."""
-        with self.lock:
+        """Clear entire buffer and wake blocked writers."""
+        with self._not_full:
             self.buf.clear()
+            self._closed = False
+            self._not_full.notify()
+
+    def close(self):
+        """Signal writers to stop blocking (used during shutdown)."""
+        with self._not_full:
+            self._closed = True
+            self._not_full.notify_all()
 
 
 class StreamDecoder:
@@ -217,6 +270,11 @@ class StreamDecoder:
             # Feed HTTP body directly to PCM buffer
             self._stream_to_buffer(leftover, threshold, autostart)
         else:
+            # Parse LAME gapless info for MP3 streams before starting ffmpeg
+            self.squeezy.lame_gapless = None
+            if fmt == "m" and leftover and len(leftover) >= 180:
+                self._parse_mp3_gapless(leftover)
+
             # Build ffmpeg command — specify input format for raw PCM
             ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
             if fmt == "p" and pcm_info:
@@ -406,6 +464,40 @@ class StreamDecoder:
                     self.squeezy.decode_complete = True
             else:
                 self.squeezy.decode_complete = True
+
+    def _parse_mp3_gapless(self, data):
+        """Parse LAME gapless metadata from the start of an MP3 stream.
+
+        Looks for Xing/Info + LAME tags in the first MPEG frame to extract
+        encoder delay and padding values for gapless playback. FFmpeg handles
+        delay trimming automatically; we store the values for logging and
+        as a safety net for end-of-track padding trimming.
+
+        Args:
+            data: Initial bytes of MP3 stream (at least 180 bytes)
+        """
+        # Skip ID3v2 tag if present
+        offset = 0
+        if len(data) > 10 and data[0:3] == b"ID3":
+            # Syncsafe integer size
+            id3_size = ((data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 |
+                        (data[8] & 0x7F) << 7 | (data[9] & 0x7F))
+            offset = 10 + id3_size
+            if data[5] & 0x10:  # Footer present
+                offset += 10
+            log.debug("Skipping ID3v2 tag: %d bytes", offset)
+
+        if offset + 180 > len(data):
+            log.debug("Not enough data after ID3 tag for LAME header parsing")
+            return
+
+        from ..config import metadata
+        lame_info = metadata.parse_lame_header(data[offset:])
+        if lame_info:
+            self.squeezy.lame_gapless = lame_info
+            log.info("MP3 gapless: delay=%d padding=%d total_samples=%d",
+                     lame_info["enc_delay"], lame_info["enc_padding"],
+                     lame_info["total_samples"])
 
     def _cleanup_ffmpeg(self):
         """Clean up ffmpeg subprocess."""

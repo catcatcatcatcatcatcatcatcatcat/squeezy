@@ -11,20 +11,35 @@ import struct
 import time
 import uuid
 
+# ---------------------------------------------------------------------------
 # SlimProto protocol constants
-SLIMPROTO_PORT = 3483
-DEVICE_ID = 12  # SqueezePlay device type
-STREAM_BUF_MAX = 2 * 1024 * 1024
+# ---------------------------------------------------------------------------
 
+SLIMPROTO_PORT = 3483            # TCP/UDP port for SlimProto communication
+DEVICE_ID = 12                   # SqueezePlay device type (we impersonate this)
+STREAM_BUF_MAX = 2 * 1024 * 1024 # Stream buffer size reported to LMS (2 MB)
+
+# ---------------------------------------------------------------------------
 # Audio format constants
-SAMPLE_RATE = 44100
-CHANNELS = 2
-BYTES_PER_FRAME = 4  # 16-bit stereo = 4 bytes per frame
+# ---------------------------------------------------------------------------
 
+SAMPLE_RATE = 44100              # Default sample rate (Hz)
+CHANNELS = 2                     # Stereo output
+BYTES_PER_FRAME = 4              # 16-bit stereo = 2 bytes × 2 channels
+
+# Supported sample rates — used to validate rates from LMS and ffmpeg.
+# Rates outside this set fall back to 44100.
+SUPPORTED_SAMPLE_RATES = [44100, 48000, 96000, 192000]
+
+# ---------------------------------------------------------------------------
 # Device buffer and latency constants
-DEVICE_BUFFER_MSEC = 40  # miniaudio buffer size
+# ---------------------------------------------------------------------------
 
-# Platform-specific pipeline latency (OS audio stack depth below miniaudio)
+DEVICE_BUFFER_MSEC = 40          # miniaudio buffer size
+
+# Platform-specific pipeline latency (OS audio stack depth below miniaudio).
+# This is the extra delay between miniaudio handing audio to the OS and the
+# user hearing it. Overridable at runtime via --latency CLI flag.
 import sys as _sys
 if _sys.platform == "darwin":
     PLATFORM_PIPELINE_MSEC = 40  # CoreAudio HAL buffer + IOAudio kernel stack
@@ -35,14 +50,115 @@ else:
 
 DEVICE_DELAY_MSEC = DEVICE_BUFFER_MSEC + PLATFORM_PIPELINE_MSEC
 
+# ---------------------------------------------------------------------------
 # Crossfade / transition type constants
-FADE_NONE = 0
-FADE_CROSSFADE = 1
-FADE_IN = 2
-FADE_OUT = 3
-FADE_INOUT = 4
+#
+# These match the values LMS sends in the strm 's' packet at offset 14.
+# They control how tracks blend at boundaries.
+# ---------------------------------------------------------------------------
 
-# Error codes
+FADE_NONE = 0       # Immediate switch, no fade
+FADE_CROSSFADE = 1  # Old fades out while new fades in
+FADE_IN = 2         # New track fades in from silence
+FADE_OUT = 3        # Old track fades out to silence
+FADE_INOUT = 4      # Both fade simultaneously
+
+# ---------------------------------------------------------------------------
+# Network timeouts and thresholds
+# ---------------------------------------------------------------------------
+
+CONNECT_TIMEOUT_SEC = 5          # TCP connect timeout for SlimProto
+RECV_TIMEOUT_SEC = 1             # Socket recv timeout in message loop
+SERVER_TIMEOUT_SEC = 35          # No-data threshold before reconnect
+                                 # (LMS sends strm-t every ~5s; 35s accommodates
+                                 # mysqueezebox.com which can go silent for ~30s)
+STREAM_CONNECT_TIMEOUT_SEC = 10  # HTTP stream connection timeout
+STREAM_READ_TIMEOUT_SEC = 5     # HTTP stream recv timeout during playback
+DISCOVERY_ATTEMPTS = 5           # UDP broadcast discovery retry count
+DISCOVERY_RECV_SIZE = 1024       # UDP discovery response buffer size
+DISCOVERY_TIMEOUT_SEC = 5        # UDP discovery socket timeout
+RECONNECT_DELAY_SEC = 2         # Delay before reconnecting after disconnect
+RETRY_DELAY_SEC = 5             # Delay before retrying failed connection
+FAILED_CONNECT_THRESHOLD = 5    # Consecutive failures before falling back to UDP
+
+# UDP discovery magic bytes (cf. squeezelite slimproto.c discovery)
+UDP_DISCOVER_PROBE = b"e"       # We send this to find LMS
+UDP_DISCOVER_RESPONSE = b"E"    # LMS replies with this prefix
+
+# HTTPS detection
+HTTPS_PORT = 443                 # Port that triggers SSL wrapping
+
+# ---------------------------------------------------------------------------
+# Streaming buffer constants
+# ---------------------------------------------------------------------------
+
+HTTP_HEADER_RECV_SIZE = 4096     # Recv size for reading HTTP response headers
+STREAM_RECV_SIZE = 32768         # Recv size for streaming audio data (32 KB)
+FFMPEG_READ_SIZE = 8192          # Chunk size for reading ffmpeg stdout (8 KB)
+MIN_THRESHOLD_BYTES = 8192      # Minimum buffer before playback starts (one chunk)
+PCM_BUF_MAX_SIZE = 4 * 1024 * 1024  # Max PCM buffer size (4 MB, ~23s at 44.1k stereo)
+
+# ---------------------------------------------------------------------------
+# LMS JSON-RPC constants
+# ---------------------------------------------------------------------------
+
+LMS_HTTP_PORT = 9000             # Default LMS web interface port
+LMS_JSONRPC_PATH = "/jsonrpc.js" # JSON-RPC endpoint path
+LMS_QUERY_TIMEOUT_SEC = 3       # Timeout for JSON-RPC queries
+
+# ---------------------------------------------------------------------------
+# Status socket constants
+# ---------------------------------------------------------------------------
+
+STATUS_UPDATE_INTERVAL_SEC = 0.5 # How often to push status to connected clients
+STATUS_SOCKET_PATH = "~/.squeezy/now_playing.sock"  # Unix socket for status
+
+# ---------------------------------------------------------------------------
+# Sync group constants
+#
+# When players are in a sync group, LMS coordinates them to start audio at
+# the exact same moment. The jiffies-based start-at-time mechanism uses
+# 32-bit unsigned arithmetic with wrap-around.
+# ---------------------------------------------------------------------------
+
+SYNC_START_WINDOW_MS = 10000     # Max ms into future we'll wait for sync target
+JIFFIES_WRAP_GUARD = 0x7FFFFFFF  # Half of u32 range — values above this in a
+                                 # diff indicate the target is in the past (wrapped)
+
+# ---------------------------------------------------------------------------
+# SETD (Set Data) protocol IDs
+# ---------------------------------------------------------------------------
+
+SETD_ID_PLAYER_NAME = 0         # ID 0 = player name query/set
+
+# ---------------------------------------------------------------------------
+# PCM format lookup tables
+#
+# These are used to decode the ASCII-digit-encoded PCM parameters in 'strm s'
+# packets. The SlimProto protocol encodes sample size, rate, channels, and
+# endianness as ASCII digit characters (cf. squeezelite pcm.c:65-67).
+# ---------------------------------------------------------------------------
+
+# Maps ASCII digit ordinal to bit depth (e.g., ord('1') → 16-bit)
+PCM_SAMPLE_SIZE_MAP = {
+    ord("0"): 8,
+    ord("1"): 16,
+    ord("2"): 20,
+    ord("3"): 24,
+    ord("4"): 32,
+}
+
+# Rate index table — the pcm_sample_rate byte is an ASCII digit index into
+# this array (e.g., '3' → index 3 → 44100 Hz)
+PCM_RATE_TABLE = [
+    11025, 22050, 32000, 44100, 48000, 8000, 12000,
+    16000, 24000, 96000, 88200, 176400, 192000, 352800, 384000,
+]
+
+# Signal strength reported in STAT packets (0xFFFF = wired connection)
+SIGNAL_STRENGTH_WIRED = 0xFFFF
+
+# Error codes for STAT packets
 ERROR_NONE = 0
 
 # ---------------------------------------------------------------------------
@@ -222,7 +338,7 @@ def build_stat(event, stream_buf_size=0, stream_buf_full=0,
         stream_buf_full,                              # stream buffer bytes used
         (bytes_received >> 32) & 0xFFFFFFFF,          # bytes received (high u32)
         bytes_received & 0xFFFFFFFF,                  # bytes received (low u32)
-        0xFFFF,                                       # signal_strength: 0xFFFF = wired
+        SIGNAL_STRENGTH_WIRED,                            # signal_strength: wired connection
         gettime_ms(),                                 # jiffies: our current ms clock
         output_buf_size,                              # output buffer total size
         output_buf_full,                              # output buffer bytes used

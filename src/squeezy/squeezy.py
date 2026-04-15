@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
-"""Squeezy - Minimal Squeezebox player for Lyrion Music Server."""
+"""Squeezy — a Python player for Lyrion Music Server (LMS).
+
+This is the main orchestrator module. It implements the SlimProto protocol
+client that registers with LMS, receives playback commands, fetches audio
+streams, and plays them through the system audio device.
+
+Architecture overview:
+
+    LMS ←→ SlimProto TCP ←→ Squeezy._message_loop()
+                                  │
+                                  ├── _handle_strm_start() → _start_stream()
+                                  │       └── _stream_worker() [stream thread]
+                                  │              ├── _do_stream() — HTTP fetch
+                                  │              ├── _stream_to_ffmpeg() or _stream_to_buffer()
+                                  │              └── _decode_reader() [decode thread]
+                                  │
+                                  └── _audio_generator() [miniaudio callback thread]
+                                          └── reads PCMBuffer → DAC
+
+Threading model:
+    main thread          — SlimProto TCP message loop (recv/send)
+    stream thread        — HTTP download → ffmpeg stdin (or direct PCM)
+    decode thread        — ffmpeg stdout → PCMBuffer
+    miniaudio cb thread  — audio generator reads PCMBuffer → DAC
+
+See CLAUDE.md for protocol details, known bugs, and architecture decisions.
+"""
 
 import argparse
 import array
@@ -8,8 +34,10 @@ from importlib.metadata import version as pkg_version
 import json
 import logging
 import os
+import re
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -26,6 +54,8 @@ from .config import metadata
 
 # Import Phase 2 modules (protocol layer)
 from .network import server_connection
+from .network import lms_metadata
+from .network import status_server
 from .protocol import lms_client
 
 # Import Phase 3 modules (audio & stream pipeline)
@@ -37,7 +67,7 @@ from .protocol import handler as protocol_handler
 
 log = logging.getLogger("squeezy")
 
-# Import protocol constants from slimproto module
+# Re-export protocol constants so other modules can import from squeezy
 SLIMPROTO_PORT = slimproto.SLIMPROTO_PORT
 DEVICE_ID = slimproto.DEVICE_ID
 STREAM_BUF_MAX = slimproto.STREAM_BUF_MAX
@@ -49,10 +79,8 @@ PLATFORM_PIPELINE_MSEC = slimproto.PLATFORM_PIPELINE_MSEC
 DEVICE_DELAY_MSEC = slimproto.DEVICE_DELAY_MSEC
 
 VERSION = pkg_version("squeezy")
-# Note: P2.6 32-bit audio support planned for future release
-# Would require updating to s32le format and 32-bit sample processing
 
-# Backward compatibility: import utility functions from slimproto module
+# Re-export utility functions from slimproto for backward compatibility
 gettime_ms = slimproto.gettime_ms
 mac_from_string = slimproto.mac_from_string
 default_mac = slimproto.default_mac
@@ -62,107 +90,42 @@ build_dsco = slimproto.build_dsco
 build_resp = slimproto.build_resp
 build_setd = slimproto.build_setd
 
-
-
-
-class StatusSocketServer:
-    """Unix domain socket server for reporting playback status to clients (e.g., macOS menu bar widget)."""
-
-    def __init__(self, squeezy_instance, socket_path):
-        self.squeezy = squeezy_instance
-        self.socket_path = socket_path
-        self.running = True
-        self.clients = []
-        self._lock = threading.Lock()
-
-    def run(self):
-        """Listen for connections and broadcast status updates."""
-        # Create socket directory if needed
-        socket_dir = os.path.dirname(self.socket_path)
-        if socket_dir and not os.path.exists(socket_dir):
-            try:
-                os.makedirs(socket_dir, mode=0o700)
-            except OSError:
-                pass
-
-        # Remove old socket file if it exists
-        try:
-            os.unlink(self.socket_path)
-        except OSError:
-            pass
-
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.bind(self.socket_path)
-            sock.listen(5)
-            sock.settimeout(1)
-            log.info("Status socket listening at %s", self.socket_path)
-
-            while self.running:
-                try:
-                    client_sock, _ = sock.accept()
-                    threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True).start()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-        except Exception as e:
-            log.warning("Status socket error: %s", e)
-        finally:
-            try:
-                if sock:
-                    sock.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(self.socket_path)
-            except OSError:
-                pass
-
-    def _handle_client(self, client_sock):
-        """Send status updates to a connected client."""
-        try:
-            last_title = ""
-            while self.running:
-                try:
-                    status = self.squeezy._status_dict()
-                    status_json = json.dumps(status) + "\n"
-                    client_sock.sendall(status_json.encode("utf-8"))
-
-                    # Detect title changes for immediate updates
-                    if status["title"] != last_title:
-                        last_title = status["title"]
-
-                    # Send every 500ms
-                    time.sleep(0.5)
-                except BrokenPipeError:
-                    break
-                except Exception:
-                    break
-        except Exception:
-            pass
-        finally:
-            try:
-                client_sock.close()
-            except Exception:
-                pass
+# Re-export StatusSocketServer for backward compatibility
+StatusSocketServer = status_server.StatusSocketServer
 
 
 # --- Squeezy Player ---
 
 class Squeezy:
+    """SlimProto player implementation for Lyrion Music Server.
+
+    Manages the full lifecycle of a player: discovery, registration, message
+    handling, audio streaming, and playback. All state lives on this class;
+    helper modules (AudioPlayer, StreamDecoder, ProtocolHandler) hold a
+    reference back to this instance for shared state access.
+    """
+
     @staticmethod
     def _load_player_name():
-        """Load player name from config file."""
+        """Load saved player name from XDG config directory."""
         return config.load_player_name()
 
     @staticmethod
     def _save_player_name(name):
-        """Save player name to config file."""
+        """Persist player name to XDG config directory."""
         config.save_player_name(name)
 
     def __init__(self, name=None, server=None, mac=None, device_id=None, latency_msec=None):
+        """Initialize the Squeezy player.
+
+        Args:
+            name: Player name shown in LMS UI (default: saved name or "Squeezy").
+                  CLI -n flag overrides the saved name.
+            server: LMS server IP. If None, uses UDP broadcast discovery.
+            mac: MAC address string ("aa:bb:cc:dd:ee:ff"). If None, auto-detected.
+            device_id: miniaudio device ID for audio output. If None, uses default.
+            latency_msec: Override for OS audio pipeline latency (for sync tuning).
+        """
         # CLI name always wins; otherwise use saved name; otherwise default
         if name:
             self.name = name
@@ -223,7 +186,7 @@ class Squeezy:
         # Sample rate tracking (variable sample rate support, like squeezelite)
         self.current_sample_rate = 44100   # Active playback rate
         self.next_sample_rate = 44100      # Upcoming track rate
-        self.supported_rates = [44100, 48000, 96000, 192000]
+        self.supported_rates = slimproto.SUPPORTED_SAMPLE_RATES
 
         # Dynamic device delay tracking — like squeezelite's snd_pcm_delay().
         # We derive buffer occupancy from wall clock: frames_yielded - frames_played.
@@ -419,42 +382,19 @@ class Squeezy:
     # --- Network ---
 
     def discover(self):
-        log.info("Discovering server...")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(5)
+        """Discover LMS on the local network via UDP broadcast.
 
-        # Try multiple broadcast addresses (255.255.255.255 fails on some macOS configs)
-        broadcast_addrs = ["255.255.255.255"]
-        try:
-            import netifaces
-            for iface in netifaces.interfaces():
-                addrs = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
-                for addr in addrs:
-                    if "broadcast" in addr:
-                        broadcast_addrs.append(addr["broadcast"])
-        except ImportError:
-            # Fallback: try common subnet broadcasts
-            broadcast_addrs.extend(["192.168.1.255", "192.168.0.255", "10.0.0.255", "172.16.0.255"])
+        Sends a discovery probe on the SlimProto port and listens for LMS
+        responses. Tries multiple broadcast addresses because 255.255.255.255
+        fails on some macOS network configurations.
 
-        for attempt in range(5):
-            for bcast in broadcast_addrs:
-                try:
-                    sock.sendto(b"e", (bcast, SLIMPROTO_PORT))
-                except OSError:
-                    continue
-            try:
-                data, addr = sock.recvfrom(1024)
-                if data and data[0:1] == b"E":
-                    log.info("Found server at %s", addr[0])
-                    sock.close()
-                    return addr[0]
-            except socket.timeout:
-                log.debug("Discovery attempt %d timed out", attempt + 1)
-        sock.close()
-        return None
+        Returns:
+            Server IP address string, or None if no server found.
+        """
+        return server_connection.ServerConnection.discover_lms(SLIMPROTO_PORT)
 
     def _send(self, data):
+        """Send a raw packet to LMS over the SlimProto TCP connection (thread-safe)."""
         with self._send_lock:
             try:
                 self.sock.sendall(data)
@@ -462,6 +402,14 @@ class Squeezy:
                 log.warning("Send error: %s", e)
 
     def _send_stat(self, event, server_timestamp=0):
+        """Send a STAT heartbeat packet to LMS with current playback state.
+
+        STAT packets are the primary way we communicate state to LMS. They carry:
+        - Event code (STMt=timer, STMs=started, STMd=decode done, STMu=underrun, etc.)
+        - Buffer occupancy (how full our stream and output buffers are)
+        - Elapsed time (how far into the current track we are)
+        - Server timestamp echo (for round-trip timing / sync)
+        """
         elapsed = self._elapsed_ms()
         # Suppress repetitive STMt logging when idle
         if event != "STMt" or self.playing:
@@ -519,6 +467,14 @@ class Squeezy:
         return int(frames * 1000 / self.current_sample_rate)
 
     def connect(self):
+        """Connect to LMS via TCP and send the HELO registration packet.
+
+        If no server IP is configured, runs UDP discovery first. On success,
+        the socket is ready for the message loop.
+
+        Returns:
+            True if connected and HELO sent, False on failure.
+        """
         if not self.server_ip:
             self.server_ip = self.discover()
             if not self.server_ip:
@@ -527,14 +483,14 @@ class Squeezy:
 
         log.info("Connecting to %s:%d", self.server_ip, SLIMPROTO_PORT)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
+        self.sock.settimeout(slimproto.CONNECT_TIMEOUT_SEC)
         try:
             self.sock.connect((self.server_ip, SLIMPROTO_PORT))
         except OSError as e:
             log.error("Connection failed: %s", e)
             return False
 
-        self.sock.settimeout(1)
+        self.sock.settimeout(slimproto.RECV_TIMEOUT_SEC)
 
         helo = build_helo(self.mac, self._capabilities(), reconnect=self.reconnect,
                           bytes_received=self.stream_bytes)
@@ -558,18 +514,25 @@ class Squeezy:
             cleanup.join(timeout=0.2)
 
     def run(self):
+        """Main player loop — connect, handle messages, reconnect on failure.
+
+        Runs until self.running is set to False (by stop() or signal handler).
+        On connection failure, retries with exponential back-off to UDP discovery
+        after FAILED_CONNECT_THRESHOLD consecutive failures.
+        """
         self.running = True
         try:
             while self.running:
                 if not self.connect():
                     self._failed_connect_count += 1
-                    if self._failed_connect_count >= 5:
-                        log.info("Failed to connect to %s 5 times — falling back to UDP discovery",
-                                 self.server_ip or "server")
+                    if self._failed_connect_count >= slimproto.FAILED_CONNECT_THRESHOLD:
+                        log.info("Failed to connect to %s %d times — falling back to UDP discovery",
+                                 self.server_ip or "server", slimproto.FAILED_CONNECT_THRESHOLD)
                         self.server_ip = None
                         self._failed_connect_count = 0
-                    log.info("Retrying in 5 seconds...")
-                    for _ in range(50):
+                    log.info("Retrying in %d seconds...", slimproto.RETRY_DELAY_SEC)
+                    # Sleep in small increments so we can respond to shutdown signals
+                    for _ in range(int(slimproto.RETRY_DELAY_SEC * 10)):
                         if not self.running:
                             break
                         time.sleep(0.1)
@@ -589,8 +552,8 @@ class Squeezy:
                             pass
                         self.sock = None
                 if self.running:
-                    log.info("Reconnecting in 2 seconds...")
-                    for _ in range(20):
+                    log.info("Reconnecting in %d seconds...", slimproto.RECONNECT_DELAY_SEC)
+                    for _ in range(int(slimproto.RECONNECT_DELAY_SEC * 10)):
                         if not self.running:
                             break
                         time.sleep(0.1)
@@ -606,6 +569,12 @@ class Squeezy:
             log.info("Shutdown complete")
 
     def _message_loop(self):
+        """Read and dispatch SlimProto messages from LMS until disconnect.
+
+        This is the main event loop. It runs on the main thread and handles
+        the SlimProto TCP framing protocol, periodic heartbeats, and server
+        timeout detection.
+        """
         # LMS sends messages in a simple framing protocol:
         #
         #   ┌──────────────────┬──────────────────────────┐
@@ -648,7 +617,7 @@ class Squeezy:
                 timeouts += 1
                 # Check elapsed time since last message — if > 35 seconds, connection is dead
                 elapsed = time.monotonic() - self._last_server_msg
-                if elapsed > 35:
+                if elapsed > slimproto.SERVER_TIMEOUT_SEC:
                     log.info("No messages from server for %.0fs — connection dead, reconnecting", elapsed)
                     return
                 continue
@@ -657,7 +626,11 @@ class Squeezy:
                     return  # Socket closed by stop() during shutdown
                 raise
 
-            # Parse all complete messages out of the accumulation buffer
+            # Parse all complete messages from the accumulation buffer.
+            # This is a two-state machine:
+            #   expect_len is None → waiting for 2-byte length prefix
+            #   expect_len is set  → waiting for that many payload bytes
+            # After extracting a complete message, reset to None for next.
             while True:
                 if expect_len is None:
                     if len(buf) < 2:
@@ -670,10 +643,16 @@ class Squeezy:
 
                 msg = bytes(buf[:expect_len])
                 buf = buf[expect_len:]
-                expect_len = None
+                expect_len = None                     # reset state for next message
                 self._handle_message(msg)
 
     def _handle_message(self, msg):
+        """Route a complete SlimProto message to the appropriate handler.
+
+        Messages are dispatched by their 4-byte ASCII opcode. Unknown opcodes
+        are logged at debug level and silently ignored (LMS may send opcodes
+        for features we don't implement yet).
+        """
         if len(msg) < 4:
             return
         opcode = msg[:4]
@@ -696,6 +675,13 @@ class Squeezy:
     # --- Message handlers ---
 
     def _handle_strm(self, msg):
+        """Handle STRM message — the main stream control command from LMS.
+
+        Dispatches to sub-handlers based on the single-character subcommand:
+            's' = start stream     'p' = pause        'u' = unpause
+            'q' = quit             'f' = flush         'a' = skip ahead
+            't' = timing request (heartbeat echo)
+        """
         if len(msg) < 5:
             return
         command = chr(msg[4])
@@ -787,6 +773,12 @@ class Squeezy:
                 self._send_stat("STMf")
 
     def _handle_strm_start(self, msg):
+        """Handle 'strm s' — start a new audio stream.
+
+        Parses the packet fields (codec, sample rate, threshold, replay gain,
+        crossfade params, server address, HTTP header), then either queues
+        the track for gapless transition or starts a new stream immediately.
+        """
         # 'strm s' packet layout (all offsets are from start of payload):
         #
         #  off  len  field
@@ -857,13 +849,9 @@ class Squeezy:
         # formats (mp3, flac, etc.) ffmpeg auto-detects from the stream.
         pcm_info = None
         if fmt == "p":
-            size_map = {ord("0"): 8, ord("1"): 16, ord("2"): 20, ord("3"): 24, ord("4"): 32}
-            bits = size_map.get(pcm_sample_size, 16)
-            # Rate is an index into this fixed table (squeezelite/pcm.c:65-67)
-            rate_table = [11025, 22050, 32000, 44100, 48000, 8000, 12000,
-                          16000, 24000, 96000, 88200, 176400, 192000, 352800, 384000]
+            bits = slimproto.PCM_SAMPLE_SIZE_MAP.get(pcm_sample_size, 16)
             rate_idx = pcm_sample_rate - ord("0") if pcm_sample_rate >= ord("0") else 0
-            rate = rate_table[rate_idx] if rate_idx < len(rate_table) else 44100
+            rate = slimproto.PCM_RATE_TABLE[rate_idx] if rate_idx < len(slimproto.PCM_RATE_TABLE) else SAMPLE_RATE
             chans = pcm_channels - ord("0") if pcm_channels >= ord("0") else 2
             if chans not in (1, 2):
                 chans = 2
@@ -904,7 +892,14 @@ class Squeezy:
         self._start_stream(stream_args)
 
     def _start_stream(self, stream_args):
-        """Begin streaming a track (called for fresh start or after drain)."""
+        """Begin streaming a new track.
+
+        Resets all per-track state (buffers, metadata, STAT flags, progress),
+        spawns the status socket server (on first call), queries LMS for track
+        metadata, and starts the stream worker thread.
+
+        Called on fresh playback start or after a gapless track drain.
+        """
         server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info = stream_args
         self.streaming = True
         self.stream_bytes = 0
@@ -949,9 +944,9 @@ class Squeezy:
 
         # Spawn status socket server on first stream start
         if not self._status_socket_started:
-            socket_path = os.path.expanduser("~/.squeezy/now_playing.sock")
+            socket_path = os.path.expanduser(slimproto.STATUS_SOCKET_PATH)
             try:
-                self._status_server = StatusSocketServer(self, socket_path)
+                self._status_server = status_server.StatusSocketServer(self, socket_path)
                 self._status_thread = threading.Thread(target=self._status_server.run, daemon=True)
                 self._status_thread.start()
                 self._status_socket_started = True
@@ -980,6 +975,12 @@ class Squeezy:
             self._start_stream(args)
 
     def _handle_audg(self, msg):
+        """Handle AUDG message — volume control from LMS remote.
+
+        The gain value is a 16.16 fixed-point number where 0x10000 = 1.0 (unity).
+        We use the left channel gain as a mono volume multiplier, capped at 1.0.
+        Only applied when the 'adjust' flag (byte 12) is set.
+        """
         if len(msg) >= 22:
             adjust = msg[12]
             gain_l = struct.unpack_from(">I", msg, 14)[0]
@@ -990,14 +991,20 @@ class Squeezy:
                       self.volume * 100, gain_l / 0x10000, gain_r / 0x10000, adjust)
 
     def _handle_setd(self, msg):
+        """Handle SETD message — get/set player data (currently just player name).
+
+        When LMS sends SETD with id=0 and no payload, it's a query — we respond
+        with our current name. When it includes a payload, it's a set — we update
+        the name and persist it to disk.
+        """
         if len(msg) < 5:
             return
         setd_id = msg[4]
-        if setd_id == 0:
+        if setd_id == slimproto.SETD_ID_PLAYER_NAME:
             if len(msg) == 5:
                 # Query player name
                 name_data = self.name.encode("utf-8") + b"\x00"
-                self._send(build_setd(0, name_data))
+                self._send(build_setd(slimproto.SETD_ID_PLAYER_NAME, name_data))
             elif len(msg) > 5:
                 # Set player name
                 new_name = msg[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -1006,9 +1013,15 @@ class Squeezy:
                     self._save_player_name(new_name)  # Persist to file
                     log.info("Player name set to: %s", self.name)
                 name_data = self.name.encode("utf-8") + b"\x00"
-                self._send(build_setd(0, name_data))
+                self._send(build_setd(slimproto.SETD_ID_PLAYER_NAME, name_data))
 
     def _handle_aude(self, msg):
+        """Handle AUDE message — audio enable/disable (no-op).
+
+        LMS sends this to enable/disable audio codecs. We don't need to act
+        on it since our codec support is static (determined at startup by
+        probing ffmpeg).
+        """
         log.debug("aude received")
 
     def _handle_cont(self, msg):
@@ -1032,6 +1045,11 @@ class Squeezy:
                 log.debug("CONT metaint updated to %d bytes", metaint)
 
     def _handle_serv(self, msg):
+        """Handle SERV message — server redirect.
+
+        LMS sends this when migrating players between server instances. We
+        update our server_ip so the next reconnect goes to the new server.
+        """
         if len(msg) >= 8:
             new_ip = struct.unpack_from(">I", msg, 4)[0]
             if new_ip:
@@ -1090,7 +1108,7 @@ class Squeezy:
                 # Artist falls back to albumartist
                 artist = self.lms_artist or self.lms_album_artist or "Unknown"
                 album = self.lms_album or "Unknown Album"
-                log.info("🎵 [%s] %s - %s%s",
+                log.info("[%s] %s - %s%s",
                          album,
                          artist,
                          self.lms_title,
@@ -1102,64 +1120,12 @@ class Squeezy:
             self.lms_title = ""
 
     def _lms_query(self, player_id, command, is_numeric=False):
-        """Query LMS for a single field via JSON-RPC.
-
-        Args:
-            player_id: MAC address string ("aa:bb:cc:dd:ee:ff")
-            command: LMS command ("title", "artist", "album", "duration", etc.)
-            is_numeric: If True, parse result as number
-
-        Returns:
-            String or numeric value, or None if query fails
-        """
-        try:
-            from urllib.request import Request, urlopen
-
-            payload = json.dumps({
-                "id": 1,
-                "method": "slim.request",
-                "params": [player_id, [command, "?"]],
-            }).encode()
-
-            url = f"http://{self.server_ip}:9000/jsonrpc.js"
-            req = Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-
-            with urlopen(req, timeout=3) as resp:
-                result_dict = json.loads(resp.read())
-                result = result_dict.get("result", {})
-                value = result.get(f"_{command}")
-
-                if is_numeric and value is not None:
-                    return float(value)
-                return value
-
-        except Exception as e:
-            log.debug("LMS query for '%s' failed: %s", command, e)
-            return None
+        """Query LMS for a single metadata field. Delegates to lms_metadata module."""
+        return lms_metadata.query_field(self.server_ip, player_id, command)
 
     def _lms_query_batch(self, player_id, fields):
-        """Query LMS for multiple fields efficiently.
-
-        Makes sequential requests for all fields in a single method call,
-        avoiding thread spawn overhead while handling each field's potential failure.
-
-        Args:
-            player_id: MAC address string ("aa:bb:cc:dd:ee:ff")
-            fields: List of field names to query (["title", "artist", "album", etc.])
-
-        Returns:
-            Dictionary of field_name: value pairs. Missing fields are not included.
-        """
-        result_dict = {}
-        for field in fields:
-            value = self._lms_query(player_id, field)
-            if value is not None:
-                result_dict[field] = value
-        return result_dict
+        """Query LMS for multiple metadata fields. Delegates to lms_metadata module."""
+        return lms_metadata.query_fields(self.server_ip, player_id, fields)
 
     def _parse_icy_metadata(self, data):
         """Parse ICY metadata block and extract title, artist, album.
@@ -1211,7 +1177,10 @@ class Squeezy:
             return False
 
     def _status_dict(self):
-        """Return current playback status as a dictionary."""
+        """Return current playback status as a dictionary for the status socket.
+
+        Prefers LMS metadata (from JSON-RPC query) over ICY metadata (from stream).
+        """
         return {
             "title": self.lms_title or self.icy_title or "Unknown",
             "artist": self.lms_artist or self.icy_artist or "",
@@ -1227,6 +1196,12 @@ class Squeezy:
     # --- Streaming ---
 
     def _stream_worker(self, server_ip, server_port, http_header, threshold, autostart, fmt="?", pcm_info=None):
+        """Stream worker thread — runs the entire HTTP stream lifecycle.
+
+        Calls _do_stream() which handles the HTTP connection, then cleans up
+        ffmpeg and sends DSCO (disconnect) to LMS when done. This runs in
+        a daemon thread so it won't prevent shutdown.
+        """
         try:
             self._do_stream(server_ip, server_port, http_header, threshold, autostart, fmt, pcm_info)
         except Exception as e:
@@ -1247,14 +1222,25 @@ class Squeezy:
                     pass
 
     def _do_stream(self, server_ip, server_port, http_header, threshold, autostart, fmt="?", pcm_info=None):
+        """Connect to the stream server and route audio to the decoder pipeline.
+
+        Handles the full HTTP stream setup:
+        1. TCP connect (with SSL wrapping for HTTPS on port 443)
+        2. Send the HTTP request that LMS gave us in the strm-s packet
+        3. Read HTTP response headers, extract ICY metaint
+        4. Forward headers to LMS (RESP packet) and confirm (STMc)
+        5. Route audio data to either:
+           - _stream_to_buffer() for PCM passthrough (native format, no ffmpeg)
+           - _stream_to_ffmpeg() for compressed formats (via ffmpeg decode)
+        """
         # Connect to stream server
         log.debug("Connecting to stream %s:%d", server_ip, server_port)
         self.stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.stream_sock.settimeout(10)
+        self.stream_sock.settimeout(slimproto.STREAM_CONNECT_TIMEOUT_SEC)
         self.stream_sock.connect((server_ip, server_port))
 
-        # Wrap with SSL if port is 443 (HTTPS) or if SSL is signaled
-        if server_port == 443:
+        # Wrap with SSL for HTTPS streams
+        if server_port == slimproto.HTTPS_PORT:
             try:
                 context = ssl.create_default_context()
                 self.stream_sock = context.wrap_socket(
@@ -1271,7 +1257,7 @@ class Squeezy:
         # Read HTTP response headers
         resp_buf = bytearray()
         while b"\r\n\r\n" not in resp_buf:
-            chunk = self.stream_sock.recv(4096)
+            chunk = self.stream_sock.recv(slimproto.HTTP_HEADER_RECV_SIZE)
             if not chunk:
                 log.warning("Stream closed during headers")
                 return
@@ -1371,7 +1357,7 @@ class Squeezy:
             return  # Already started or signalled
 
         avail = self.pcm_buf.available()
-        if not force and avail < max(threshold, 8192):
+        if not force and avail < max(threshold, slimproto.MIN_THRESHOLD_BYTES):
             return  # Threshold not yet reached
 
         # Use the live autostart value (CONT may have decremented it)
@@ -1398,10 +1384,10 @@ class Squeezy:
             self.stream_bytes += len(leftover)
             self.pcm_buf.write(leftover)
 
-        self.stream_sock.settimeout(5)
+        self.stream_sock.settimeout(slimproto.STREAM_READ_TIMEOUT_SEC)
         while self.streaming and self.running:
             try:
-                data = self.stream_sock.recv(32768)
+                data = self.stream_sock.recv(slimproto.STREAM_RECV_SIZE)
                 if not data:
                     break
                 self.stream_bytes += len(data)
@@ -1445,10 +1431,10 @@ class Squeezy:
         if leftover:
             self.stream_bytes += len(leftover)
 
-        self.stream_sock.settimeout(5)
+        self.stream_sock.settimeout(slimproto.STREAM_READ_TIMEOUT_SEC)
         while self.streaming and self.running:
             try:
-                chunk = self.stream_sock.recv(32768)
+                chunk = self.stream_sock.recv(slimproto.STREAM_RECV_SIZE)
                 if not chunk:
                     break
                 self.stream_bytes += len(chunk)
@@ -1540,7 +1526,7 @@ class Squeezy:
                 if not self.ffmpeg_proc:
                     log.debug("Decode reader: ffmpeg_proc is None, exiting")
                     break
-                data = self.ffmpeg_proc.stdout.read(8192)
+                data = self.ffmpeg_proc.stdout.read(slimproto.FFMPEG_READ_SIZE)
                 if not data:
                     log.debug("Decode reader: ffmpeg stdout closed")
                     break
@@ -1575,6 +1561,11 @@ class Squeezy:
         log.debug("Decode complete, %d bytes buffered", self.pcm_buf.available())
 
     def _cleanup_ffmpeg(self):
+        """Terminate the ffmpeg subprocess and close all its pipes.
+
+        Order matters: close stdin first (signals EOF to ffmpeg), then kill,
+        then close stdout (unblocks any thread doing stdout.read()), then wait.
+        """
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.stdin.close()
@@ -1690,8 +1681,25 @@ class Squeezy:
                   self._current_track_id, self._track_start_frames)
 
     def _audio_generator(self):
-        """Generator that yields PCM data for miniaudio playback.
-        miniaudio sends framecount via send(), we yield bytes back."""
+        """Generator that yields PCM data to the miniaudio playback device.
+
+        miniaudio calls send(framecount) on this generator from its callback
+        thread, and we yield exactly framecount * BYTES_PER_FRAME bytes back.
+
+        This generator is the heart of the audio pipeline. It handles:
+        - Silence during pause and sync-wait periods
+        - Reading PCM data from the buffer and tracking elapsed frames
+        - Accumulating tail samples for crossfade at track boundaries
+        - Initializing and applying crossfade mixing between tracks
+        - Volume and replay gain scaling
+        - STMd/STMu signaling when tracks complete
+        - Gapless track transitions (starting new stream without closing device)
+        - Buffer underrun detection (STMo)
+
+        IMPORTANT: self.playing must be True BEFORE device.start(gen) because
+        on Linux the miniaudio callback fires immediately and this generator
+        checks self.playing before yielding any data.
+        """
         required_frames = yield b""  # priming yield
         while self.playing and self.running:
             if self.paused:
@@ -1704,15 +1712,25 @@ class Squeezy:
             # (like squeezelite's OUTPUT_START_AT state)
             if self.start_at_jiffies:
                 now = gettime_ms()
+                # 32-bit unsigned subtraction with wrap-around handling:
+                # - Mask to u32 range (& 0xFFFFFFFF)
+                # - diff < JIFFIES_WRAP_GUARD: target is in the future (not wrapped past)
+                # - diff > 0: target hasn't been reached yet
+                # - diff < SYNC_START_WINDOW_MS: target is within a reasonable window
+                #   (avoids waiting forever on stale or bogus timestamps)
                 diff = (self.start_at_jiffies - now) & 0xFFFFFFFF
-                if diff < 0x7FFFFFFF and diff > 0 and diff < 10000:
+                if (diff < slimproto.JIFFIES_WRAP_GUARD
+                        and diff > 0
+                        and diff < slimproto.SYNC_START_WINDOW_MS):
                     required_frames = yield b"\x00" * required_bytes
                     continue
                 # Target reached or passed — clear and start real audio
                 log.debug("Sync target reached (target=%d now=%d) — starting audio",
                           self.start_at_jiffies, now)
                 self.start_at_jiffies = 0
-                self.output_frames = 0  # Reset for accurate elapsed time
+                # Reset output_frames so elapsed time starts from zero at the
+                # moment real audio begins — the silence frames don't count.
+                self.output_frames = 0
                 self._send_stat("STMs")  # Tell LMS track started
 
             avail = self.pcm_buf.available()
@@ -1726,18 +1744,29 @@ class Squeezy:
                         self._device_start_time = time.monotonic()
                         self._device_start_frames = self.output_frames
                     self.output_frames += len(chunk) // BYTES_PER_FRAME
-                    # Accumulate tail samples for crossfade while draining
+                    # Crossfade tail accumulation: while the old track is draining
+                    # (decode done, next track queued), save the last N seconds of
+                    # audio. This becomes the "old side" of the crossfade mix when
+                    # the new track starts. We only accumulate when all three
+                    # conditions are true:
+                    #   - decode_complete: old track's decoder has finished
+                    #   - transition_type > 0: LMS requested a fade transition
+                    #   - _pending_track: next track is queued and waiting
                     if self.decode_complete and self.transition_type > 0 and self._pending_track:
                         self._crossfade_samples.extend(chunk)
-                        # Keep only the last N bytes (transition_period worth of audio)
+                        # Cap to transition_period worth of audio (sliding window)
                         max_bytes = int(self.transition_period_sec * self.current_sample_rate * BYTES_PER_FRAME)
                         if len(self._crossfade_samples) > max_bytes:
                             self._crossfade_samples = self._crossfade_samples[-max_bytes:]
                     if len(chunk) < required_bytes:
                         chunk += b"\x00" * (required_bytes - len(chunk))
 
-                    # Crossfade support: Check if we should initialize crossfade
-                    # for this chunk (first chunk of new track after boundary)
+                    # Crossfade initialization gate: this fires on the first chunk
+                    # of a new track after _reset_track_state() clears _crossfade_enabled.
+                    # It requires _crossfade_samples to be non-empty (populated during
+                    # the old track's drain phase above). The timing is: old track drains
+                    # → tail samples accumulated → gapless switch → first new chunk
+                    # arrives here → crossfade curves are built and mixing begins.
                     if self.transition_type > 0 and not self._crossfade_enabled:
                         fade_duration_samples = int(self.transition_period_sec * self.current_sample_rate)
                         if fade_duration_samples > 0 and len(self._crossfade_samples) > 0:
@@ -1816,6 +1845,13 @@ class Squeezy:
         log.info("Playback finished")
 
     def _start_audio(self, sample_rate=None):
+        """Create a miniaudio playback device and start the audio generator.
+
+        Opens the audio device at the requested sample rate, primes the
+        generator (first yield returns empty bytes), and starts playback.
+        self.playing is set True BEFORE device.start() — this is critical
+        because on Linux the callback fires immediately.
+        """
         if self.playing:
             return
 
@@ -1851,6 +1887,12 @@ class Squeezy:
         self._start_audio()
 
     def _resume_audio(self, sample_rate=None):
+        """Resume audio after pause by closing the old device and creating a new one.
+
+        We can't simply unpause miniaudio — we need a fresh device and generator
+        because the old generator's state is stale. Dynamic delay tracking is also
+        reset because the old wall-clock reference is no longer valid after pause.
+        """
         if not self.playing:
             self._start_audio(sample_rate)
             return
@@ -1889,6 +1931,19 @@ class Squeezy:
             log.error("Audio resume failed: %s", e)
 
     def _stop_playback(self):
+        """Stop all playback and clean up threads/resources.
+
+        Teardown order is critical to avoid deadlocks:
+        1. Signal all loops to stop (streaming=False, playing=False)
+        2. Close PCM buffer (unblocks decode thread stuck on buf.write())
+        3. Close stream socket (unblocks stream thread stuck on recv())
+        4. Kill ffmpeg (unblocks decode thread on stdout.read(),
+           stream thread on stdin.write())
+        5. Join decode thread (should be unblocked now)
+        6. Join stream thread (it also joins decode, but it's already done)
+        7. Close audio device LAST (generator exits via playing=False)
+        8. Flush PCM buffer for reuse
+        """
         self.streaming = False
         self.playing = False
         self.paused = False

@@ -9,17 +9,25 @@ import logging
 import socket
 import struct
 
+from . import slimproto
+
 log = logging.getLogger("squeezy")
 
 
 class ProtocolHandler:
-    """Routes and handles SlimProto protocol messages."""
+    """Routes and handles incoming SlimProto protocol messages from LMS.
+
+    Each handler method parses the opcode-specific fields from the raw message
+    bytes and triggers the appropriate state transitions on the Squeezy instance.
+    This class holds no state of its own — all player state lives on self.squeezy.
+    """
 
     def __init__(self, squeezy_ref):
         """Initialize protocol handler.
 
         Args:
-            squeezy_ref: Reference to Squeezy instance
+            squeezy_ref: Reference to the Squeezy player instance. All handler
+                         methods read/write state via this reference.
         """
         self.squeezy = squeezy_ref
 
@@ -88,7 +96,6 @@ class ProtocolHandler:
             if len(msg) >= 22:
                 target_jiffies = struct.unpack_from(">I", msg, 18)[0]
             self.squeezy.start_at_jiffies = target_jiffies
-            from . import slimproto
             log.debug("Unpause at: %d now: %d", target_jiffies, slimproto.gettime_ms())
             if self.squeezy.paused:
                 self.squeezy.paused = False
@@ -112,12 +119,11 @@ class ProtocolHandler:
         elif subcommand == "a":
             # Skip ahead — replay_gain field = milliseconds to skip
             if len(msg) >= 22:
-                from .. import squeezy as sq_module
                 skip_ms = struct.unpack_from(">I", msg, 18)[0]
                 skip_frames = int(skip_ms * self.squeezy.current_sample_rate / 1000)
-                skip_bytes = skip_frames * sq_module.BYTES_PER_FRAME
+                skip_bytes = skip_frames * slimproto.BYTES_PER_FRAME
                 actual = self.squeezy.pcm_buf.skip(skip_bytes)
-                skipped_frames = actual // sq_module.BYTES_PER_FRAME
+                skipped_frames = actual // slimproto.BYTES_PER_FRAME
                 self.squeezy.output_frames += skipped_frames
                 log.debug("Skip ahead: %d ms (%d frames requested, %d skipped)",
                          skip_ms, skip_frames, skipped_frames)
@@ -139,13 +145,14 @@ class ProtocolHandler:
         if len(payload) < 24:
             return
 
-        autostart = payload[1] - ord("0") if len(payload) > 1 else 0
-        fmt = chr(payload[2]) if len(payload) > 2 else "?"
-        pcm_sample_size = payload[3] if len(payload) > 3 else ord("1")
-        pcm_sample_rate = payload[4] if len(payload) > 4 else ord("3")
-        pcm_channels = payload[5] if len(payload) > 5 else ord("2")
-        pcm_endian = payload[6] if len(payload) > 6 else ord("0")
-        threshold = payload[7] * 1024 if len(payload) > 7 else 0
+        # Field names correspond to 'strm s' packet layout in squeezy.py
+        autostart = payload[1] - ord("0") if len(payload) > 1 else 0     # payload[1]: autostart mode
+        fmt = chr(payload[2]) if len(payload) > 2 else "?"               # payload[2]: codec format
+        pcm_sample_size = payload[3] if len(payload) > 3 else ord("1")   # payload[3]: sample size
+        pcm_sample_rate = payload[4] if len(payload) > 4 else ord("3")   # payload[4]: rate index
+        pcm_channels = payload[5] if len(payload) > 5 else ord("2")      # payload[5]: channels
+        pcm_endian = payload[6] if len(payload) > 6 else ord("0")        # payload[6]: endianness
+        threshold = payload[7] * 1024 if len(payload) > 7 else 0         # payload[7]: threshold (KB)
 
         # Extract replay_gain (16.16 fixed-point at offset 14)
         # Raw value 0 means "no replay gain" → use unity (1.0)
@@ -180,10 +187,8 @@ class ProtocolHandler:
         # PCM format fields use ASCII digit encoding
         pcm_info = None
         if fmt == "p":
-            size_map = {ord("0"): 8, ord("1"): 16, ord("2"): 20, ord("3"): 24, ord("4"): 32}
-            bits = size_map.get(pcm_sample_size, 16)
-            rate_table = [11025, 22050, 32000, 44100, 48000, 8000, 12000,
-                          16000, 24000, 96000, 88200, 176400, 192000, 352800, 384000]
+            bits = slimproto.PCM_SAMPLE_SIZE_MAP.get(pcm_sample_size, 16)
+            rate_table = slimproto.PCM_RATE_TABLE
             rate_idx = pcm_sample_rate - ord("0") if pcm_sample_rate >= ord("0") else 0
             rate = rate_table[rate_idx] if rate_idx < len(rate_table) else 44100
             chans = pcm_channels - ord("0") if pcm_channels >= ord("0") else 2
@@ -248,7 +253,7 @@ class ProtocolHandler:
         setd_id = msg[4]
         log.debug("SETD: id=%d msg_len=%d", setd_id, len(msg))
 
-        if setd_id == 0:  # Player name
+        if setd_id == slimproto.SETD_ID_PLAYER_NAME:
             if len(msg) == 5:
                 # Query — return current name (null-terminated, matches squeezelite)
                 log.debug("SETD query for player name, responding: %s", self.squeezy.name)
@@ -265,12 +270,15 @@ class ProtocolHandler:
                     log.info("Player name set to: %s", self.squeezy.name)
             # Always respond with current name (matches squeezelite)
             name_data = self.squeezy.name.encode("utf-8") + b"\x00"
-            from . import slimproto
-            self.squeezy._send(slimproto.build_setd(0, name_data))
+            self.squeezy._send(slimproto.build_setd(slimproto.SETD_ID_PLAYER_NAME, name_data))
 
     def handle_aude(self, msg):
-        """Handle AUDE message (audio end/codec end) — no-op."""
-        pass
+        """Handle AUDE message — audio enable/disable (no-op).
+
+        LMS sends this to toggle codec support. We don't need to act on it
+        since our codec support is static (determined by ffmpeg at startup).
+        """
+        log.debug("aude received (no-op)")
 
     def handle_cont(self, msg):
         """Handle CONT message — sync continuation signal."""

@@ -11,6 +11,8 @@ import time
 
 import miniaudio
 
+from ..protocol import slimproto
+
 log = logging.getLogger("squeezy")
 
 
@@ -34,7 +36,7 @@ class AudioPlayer:
         Returns:
             Supported rate from [44100, 48000, 96000, 192000], or 44100 as fallback
         """
-        supported = [44100, 48000, 96000, 192000]
+        supported = slimproto.SUPPORTED_SAMPLE_RATES
         if requested_rate in supported:
             return requested_rate
         return 44100
@@ -61,17 +63,15 @@ class AudioPlayer:
         self.squeezy.current_sample_rate = self.get_supported_rate(rate)
         log.info("Starting audio playback at %d Hz", self.squeezy.current_sample_rate)
         try:
-            # Import constants from squeezy module
-            from .. import squeezy as sq_module
             self.squeezy.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=sq_module.CHANNELS,
+                nchannels=slimproto.CHANNELS,
                 sample_rate=self.squeezy.current_sample_rate,
-                buffersize_msec=sq_module.DEVICE_BUFFER_MSEC,
+                buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.squeezy.audio_device_id,
             )
             log.debug("Audio device buffer: %dms (requested %dms)",
-                      self.squeezy.device.buffersize_msec, sq_module.DEVICE_BUFFER_MSEC)
+                      self.squeezy.device.buffersize_msec, slimproto.DEVICE_BUFFER_MSEC)
             self.squeezy.playing = True  # Set BEFORE start() — generator checks immediately
             self.squeezy.paused = False
             self.squeezy.output_frames = 0
@@ -120,12 +120,11 @@ class AudioPlayer:
                 pass
             self.squeezy.device = None
         try:
-            from .. import squeezy as sq_module
             self.squeezy.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=sq_module.CHANNELS,
+                nchannels=slimproto.CHANNELS,
                 sample_rate=self.squeezy.current_sample_rate,
-                buffersize_msec=sq_module.DEVICE_BUFFER_MSEC,
+                buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.squeezy.audio_device_id,
             )
             gen = self.squeezy._audio_generator()
@@ -143,8 +142,6 @@ class AudioPlayer:
         Returns:
             Milliseconds of audio played (relative to current track)
         """
-        from .. import squeezy as sq_module
-
         # For true gapless, calculate relative to current track
         frames_in_track = self.squeezy.output_frames - self.squeezy._track_start_frames
         if frames_in_track <= 0:
@@ -153,7 +150,7 @@ class AudioPlayer:
         if self.squeezy._device_start_time is None:
             # Not yet playing real audio — use static estimate
             device_delay_frames = self.squeezy.current_sample_rate * (
-                sq_module.DEVICE_BUFFER_MSEC + self.squeezy.pipeline_latency_msec
+                slimproto.DEVICE_BUFFER_MSEC + self.squeezy.pipeline_latency_msec
             ) // 1000
         else:
             # Measure buffer occupancy from wall clock: how much wall time

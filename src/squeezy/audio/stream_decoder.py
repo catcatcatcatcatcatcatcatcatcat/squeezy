@@ -13,6 +13,8 @@ import subprocess
 import threading
 import time
 
+from ..protocol import slimproto
+
 log = logging.getLogger("squeezy")
 
 
@@ -29,8 +31,10 @@ class PCMBuffer:
     while ensuring no audio data is lost.
     """
 
-    # Default max buffer: ~23 seconds at 44100Hz stereo 16-bit (4 MB)
-    MAX_SIZE = 4 * 1024 * 1024
+    # Default max buffer: ~23 seconds at 44100Hz stereo 16-bit (4 MB).
+    # This is the physical buffer limit; STREAM_BUF_MAX (2 MB) is what we
+    # report to LMS. The physical buffer is larger to absorb decode bursts.
+    MAX_SIZE = slimproto.PCM_BUF_MAX_SIZE
 
     def __init__(self, max_size=None):
         """Initialize empty buffer.
@@ -198,7 +202,6 @@ class StreamDecoder:
             self.squeezy.streaming = False
             self._cleanup_ffmpeg()
             try:
-                from ..protocol import slimproto
                 self.squeezy._send(slimproto.build_dsco(0))
             except Exception:
                 pass
@@ -208,11 +211,11 @@ class StreamDecoder:
         # Connect to stream server
         log.debug("Connecting to stream %s:%d", server_ip, server_port)
         self.squeezy.stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.squeezy.stream_sock.settimeout(10)
+        self.squeezy.stream_sock.settimeout(slimproto.STREAM_CONNECT_TIMEOUT_SEC)
         self.squeezy.stream_sock.connect((server_ip, server_port))
 
         # Wrap with SSL if port is 443 (HTTPS)
-        if server_port == 443:
+        if server_port == slimproto.HTTPS_PORT:
             try:
                 context = ssl.create_default_context()
                 self.squeezy.stream_sock = context.wrap_socket(
@@ -229,7 +232,7 @@ class StreamDecoder:
         # Read HTTP response headers
         resp_buf = bytearray()
         while b"\r\n\r\n" not in resp_buf:
-            chunk = self.squeezy.stream_sock.recv(4096)
+            chunk = self.squeezy.stream_sock.recv(slimproto.HTTP_HEADER_RECV_SIZE)
             if not chunk:
                 log.warning("Stream closed during headers")
                 return
@@ -253,17 +256,15 @@ class StreamDecoder:
         except Exception:
             pass
 
-        # Send RESP and STMc packets to LMS
-        from ..protocol import slimproto
+        # Send RESP (forward HTTP headers) and STMc (connected) to LMS
         self.squeezy._send(slimproto.build_resp(resp_headers))
         self.squeezy._send_stat("STMc")
 
-        # For raw PCM at native format, skip ffmpeg entirely
-        from .. import squeezy as sq_module
+        # For raw PCM at our native format (16-bit LE stereo 44.1k), skip ffmpeg
         pcm_passthrough = (fmt == "p" and pcm_info
                            and pcm_info["bits"] == 16 and pcm_info["endian"] == "le"
-                           and pcm_info["rate"] == sq_module.SAMPLE_RATE
-                           and pcm_info["channels"] == sq_module.CHANNELS)
+                           and pcm_info["rate"] == slimproto.SAMPLE_RATE
+                           and pcm_info["channels"] == slimproto.CHANNELS)
 
         if pcm_passthrough:
             log.debug("PCM passthrough (no ffmpeg needed)")
@@ -286,7 +287,7 @@ class StreamDecoder:
             # Input from stdin, output: always s16le PCM at target sample rate
             ffmpeg_cmd.extend(["-i", "pipe:0",
                                "-f", "s16le", "-ar", str(self.squeezy.next_sample_rate),
-                               "-ac", str(sq_module.CHANNELS),
+                               "-ac", str(slimproto.CHANNELS),
                                "pipe:1"])
 
             log.debug("FFmpeg command: %s", " ".join(ffmpeg_cmd))
@@ -318,10 +319,10 @@ class StreamDecoder:
                 bytes_since_meta += len(leftover)
                 log.debug("FFmpeg stdin: seeded with %d leftover bytes", len(leftover))
 
-            self.squeezy.stream_sock.settimeout(5)
+            self.squeezy.stream_sock.settimeout(slimproto.STREAM_READ_TIMEOUT_SEC)
             while self.squeezy.streaming:
                 try:
-                    chunk = self.squeezy.stream_sock.recv(32768)
+                    chunk = self.squeezy.stream_sock.recv(slimproto.STREAM_RECV_SIZE)
                     if not chunk:
                         log.debug("Stream closed after %d bytes", bytes_sent)
                         break
@@ -389,10 +390,10 @@ class StreamDecoder:
                 bytes_received += len(leftover)
                 self.squeezy.stream_bytes = bytes_received
 
-            self.squeezy.stream_sock.settimeout(5)
+            self.squeezy.stream_sock.settimeout(slimproto.STREAM_READ_TIMEOUT_SEC)
             while self.squeezy.streaming:
                 try:
-                    chunk = self.squeezy.stream_sock.recv(32768)
+                    chunk = self.squeezy.stream_sock.recv(slimproto.STREAM_RECV_SIZE)
                     if not chunk:
                         log.debug("Stream closed after %d bytes", bytes_received)
                         break
@@ -436,7 +437,7 @@ class StreamDecoder:
                 if not self.squeezy.ffmpeg_proc:
                     log.debug("Decode reader: ffmpeg_proc is None, exiting")
                     break
-                chunk = self.squeezy.ffmpeg_proc.stdout.read(8192)
+                chunk = self.squeezy.ffmpeg_proc.stdout.read(slimproto.FFMPEG_READ_SIZE)
                 if not chunk:
                     log.debug("FFmpeg closed after %d bytes", bytes_received)
                     break
@@ -524,7 +525,7 @@ class StreamDecoder:
             return  # Already started or signalled
 
         avail = self.squeezy.pcm_buf.available()
-        if not force and avail < max(threshold, 8192):
+        if not force and avail < max(threshold, slimproto.MIN_THRESHOLD_BYTES):
             return  # Threshold not yet reached
 
         # Use the live autostart value (CONT may have decremented it)

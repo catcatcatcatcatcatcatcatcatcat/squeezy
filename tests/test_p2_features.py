@@ -39,7 +39,7 @@ class TestP23ReplayGain:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)  # localhost
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
 
         # replay_gain should be 0x18000 / 0x10000 = 1.5
         assert abs(squeezy.replay_gain - 1.5) < 0.01
@@ -58,7 +58,7 @@ class TestP23ReplayGain:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.replay_gain == 1.0
 
     def test_replay_gain_boost(self):
@@ -75,7 +75,7 @@ class TestP23ReplayGain:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.replay_gain == 2.0
 
     def test_replay_gain_cut(self):
@@ -92,7 +92,7 @@ class TestP23ReplayGain:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert abs(squeezy.replay_gain - 0.5) < 0.01
 
     def test_replay_gain_default_short_packet(self):
@@ -106,7 +106,7 @@ class TestP23ReplayGain:
         msg[5] = ord("1")
         msg[6] = ord("m")
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.replay_gain == 1.0
 
 
@@ -231,7 +231,7 @@ class TestP25VariableSampleRate:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
 
         # Rate index 3 = 44100 Hz
         assert squeezy.next_sample_rate == 44100
@@ -254,7 +254,7 @@ class TestP25VariableSampleRate:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.next_sample_rate == 48000
 
     def test_detect_rate_compressed_default(self):
@@ -271,7 +271,7 @@ class TestP25VariableSampleRate:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
 
         # Before ffmpeg detection, should default to 44100
         assert squeezy.next_sample_rate == 44100
@@ -438,7 +438,7 @@ class TestP22Crossfade:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
 
         assert squeezy.transition_type == 1
         assert squeezy.transition_period_sec == 3
@@ -459,7 +459,7 @@ class TestP22Crossfade:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.transition_type == 0
 
     def test_transition_type_fade_in(self):
@@ -478,7 +478,7 @@ class TestP22Crossfade:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.transition_type == 2
 
     def test_transition_type_fade_out(self):
@@ -497,7 +497,7 @@ class TestP22Crossfade:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.transition_type == 3
 
     def test_transition_type_fade_inout(self):
@@ -516,7 +516,7 @@ class TestP22Crossfade:
         struct.pack_into(">H", msg, 22, 3483)
         struct.pack_into(">I", msg, 24, 0)
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
         assert squeezy.transition_type == 4
 
     def test_build_fade_curves_linear(self):
@@ -667,7 +667,7 @@ class TestP22Crossfade:
         msg[5] = ord("1")
         msg[6] = ord("m")
 
-        squeezy._handle_strm_start(bytes(msg))
+        squeezy.protocol._handle_strm_start(bytes(msg))
 
         assert squeezy.transition_type == 0
         assert squeezy.transition_period_sec == 0

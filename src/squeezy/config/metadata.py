@@ -157,10 +157,15 @@ def parse_lame_header(data):
     if delay_offset + 3 > len(data):
         return None
 
+    # Three bytes encode two 12-bit values: [DDDDDDDD DDDDPPPP PPPPPPPP]
+    # enc_delay  = upper 8 bits of byte 0 + upper 4 bits of byte 1 (12 bits total)
+    # enc_padding = lower 4 bits of byte 1 + all 8 bits of byte 2 (12 bits total)
     enc_delay = (data[delay_offset] << 4) | (data[delay_offset + 1] >> 4)
     enc_padding = ((data[delay_offset + 1] & 0x0F) << 8) | data[delay_offset + 2]
 
-    total_samples = frame_count * 1152 - enc_delay - enc_padding if frame_count else 0
+    # MPEG Layer III uses 1152 samples per frame (ISO/IEC 11172-3)
+    MP3_SAMPLES_PER_FRAME = 1152
+    total_samples = frame_count * MP3_SAMPLES_PER_FRAME - enc_delay - enc_padding if frame_count else 0
 
     log.debug("LAME gapless: delay=%d padding=%d frames=%d total_samples=%d",
               enc_delay, enc_padding, frame_count, total_samples)

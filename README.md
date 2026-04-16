@@ -85,19 +85,20 @@ Your player will appear in the Lyrion Music Server web UI. Select it from the pl
 
 ```
 src/squeezy/
-├── squeezy.py          # Main player orchestrator
-├── audio/              # Audio playback & streaming
-│   ├── player.py       # miniaudio device, mixing, crossfade
-│   └── stream_decoder.py # HTTP streaming & FFmpeg
-├── protocol/           # SlimProto protocol & LMS communication
-│   ├── handler.py      # Message dispatch & parsing
-│   ├── slimproto.py    # Protocol constants & packet builders
-│   └── lms_client.py   # LMS message operations
-├── network/            # Network connectivity
-│   └── server_connection.py # Socket management
-└── config/             # Configuration & metadata
-    ├── config.py       # XDG-compliant config
-    └── metadata.py     # ICY metadata parsing
+├── squeezy.py              # Main player orchestrator & audio pipeline
+├── audio/
+│   └── stream_decoder.py   # Thread-safe PCMBuffer
+├── protocol/
+│   ├── handler.py          # SlimProto message handlers (strm, audg, setd, etc.)
+│   ├── slimproto.py        # Protocol constants & packet builders
+│   └── lms_client.py       # LMS message operations
+├── network/
+│   ├── server_connection.py # TCP/UDP socket management & discovery
+│   ├── lms_metadata.py     # LMS JSON-RPC track metadata queries
+│   └── status_server.py    # Unix socket status server
+└── config/
+    ├── config.py           # XDG-compliant config persistence
+    └── metadata.py         # ICY metadata & LAME gapless parsing
 ```
 
 ## Contributing
@@ -128,24 +129,9 @@ brew untap catcatcatcatcatcatcatcatcatcat/tap
 
 ## Releasing (for maintainers)
 
-Version is defined in one place: `pyproject.toml`. To release:
-
-```bash
-# 1. Bump version in pyproject.toml
-# 2. Commit, tag, and push
-git add -A && git commit -m "Release vX.Y.Z"
-git tag vX.Y.Z && git push origin main vX.Y.Z
-
-# 3. Build and publish to PyPI
-python -m build && twine upload dist/squeezy-X.Y.Z*
-
-# 4. Update Homebrew tap (macOS formula)
-# Get the SHA256 of the new tag tarball:
-curl -sL https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-# Update url + sha256 in homebrew-tap/Formula/squeezy.rb, commit and push
-```
-
-All installed users will see an upgrade notice on next startup.
+See [DEVELOPER.md](DEVELOPER.md#how-to-release-a-new-version) for the full
+release process. The short version: bump `version` in `pyproject.toml`, tag,
+build, upload to PyPI, update the Homebrew tap.
 
 ## License
 

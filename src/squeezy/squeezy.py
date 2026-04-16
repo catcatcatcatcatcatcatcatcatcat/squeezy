@@ -47,51 +47,25 @@ from urllib.request import urlopen
 
 import miniaudio
 
-# Import Phase 1 modules (foundation)
+# Foundation modules
 from .protocol import slimproto
 from .config import config
 from .config import metadata
 
-# Import Phase 2 modules (protocol layer)
+# Network and protocol modules
 from .network import server_connection
 from .network import lms_metadata
 from .network import status_server
-from .protocol import lms_client
 
-# Import Phase 3 modules (audio & stream pipeline)
-from .audio import player as audio_player
-from .audio import stream_decoder
+# Audio buffer (PCMBuffer is the only class used from the audio package)
+from .audio.stream_decoder import PCMBuffer
 
-# Import Phase 4 module (message dispatch)
+# Message dispatch — all protocol parsing lives in handler.py
 from .protocol import handler as protocol_handler
 
 log = logging.getLogger("squeezy")
 
-# Re-export protocol constants so other modules can import from squeezy
-SLIMPROTO_PORT = slimproto.SLIMPROTO_PORT
-DEVICE_ID = slimproto.DEVICE_ID
-STREAM_BUF_MAX = slimproto.STREAM_BUF_MAX
-SAMPLE_RATE = slimproto.SAMPLE_RATE
-CHANNELS = slimproto.CHANNELS
-BYTES_PER_FRAME = slimproto.BYTES_PER_FRAME
-DEVICE_BUFFER_MSEC = slimproto.DEVICE_BUFFER_MSEC
-PLATFORM_PIPELINE_MSEC = slimproto.PLATFORM_PIPELINE_MSEC
-DEVICE_DELAY_MSEC = slimproto.DEVICE_DELAY_MSEC
-
 VERSION = pkg_version("squeezy")
-
-# Re-export utility functions from slimproto for backward compatibility
-gettime_ms = slimproto.gettime_ms
-mac_from_string = slimproto.mac_from_string
-default_mac = slimproto.default_mac
-build_helo = slimproto.build_helo
-build_stat = slimproto.build_stat
-build_dsco = slimproto.build_dsco
-build_resp = slimproto.build_resp
-build_setd = slimproto.build_setd
-
-# Re-export StatusSocketServer for backward compatibility
-StatusSocketServer = status_server.StatusSocketServer
 
 
 # --- Squeezy Player ---
@@ -133,7 +107,7 @@ class Squeezy:
             saved_name = self._load_player_name()
             self.name = saved_name if saved_name else "Squeezy"
         self.server_ip = server
-        self.mac = mac_from_string(mac) if mac else default_mac()
+        self.mac = slimproto.mac_from_string(mac) if mac else slimproto.default_mac()
         self.audio_device_id = device_id
         self.sock = None
         self.running = False
@@ -142,14 +116,11 @@ class Squeezy:
         self.server_timestamp = 0
         self._failed_connect_count = 0  # Reconnection fallback to UDP discovery
 
-        # Audio & stream pipeline components
-        self.audio = audio_player.AudioPlayer(self)
-        self.stream = stream_decoder.StreamDecoder(self)
-        self.pcm_buf = stream_decoder.PCMBuffer()
+        # Audio buffer (thread-safe, shared by stream/decode/miniaudio threads)
+        self.pcm_buf = PCMBuffer()
 
-        # Message dispatch
+        # Message dispatch — all protocol parsing lives in handler.py
         self.protocol = protocol_handler.ProtocolHandler(self)
-
 
         # Stream state
         # Thread safety note: stream_sock, ffmpeg_proc are written by main thread
@@ -181,7 +152,7 @@ class Squeezy:
         self.volume = 1.0  # 0.0–1.0, set by audg from LMS
         self.replay_gain = 1.0  # 1.0 = unity, set from strm 's' packet (16.16 fixed-point)
         # OS pipeline latency below miniaudio (overridable via --latency)
-        self.pipeline_latency_msec = latency_msec if latency_msec is not None else PLATFORM_PIPELINE_MSEC
+        self.pipeline_latency_msec = latency_msec if latency_msec is not None else slimproto.PLATFORM_PIPELINE_MSEC
 
         # Sample rate tracking (variable sample rate support, like squeezelite)
         self.current_sample_rate = 44100   # Active playback rate
@@ -351,6 +322,15 @@ class Squeezy:
         return standard_codecs
 
     def _capabilities(self):
+        """Build the HELO capabilities string for LMS registration.
+
+        Returns a comma-separated string describing this player's features,
+        model, firmware version, supported codecs, and maximum sample rate.
+        LMS uses this to decide which codec to stream, what UI to show, and
+        whether to send frame-accurate timing requests.
+
+        Probes ffmpeg at startup to discover available decoders dynamically.
+        """
         # The capabilities string is sent in the HELO packet and tells LMS
         # what this player can do.  LMS uses it to decide:
         #   - Which codec to use (we list what ffmpeg can decode for us)
@@ -391,7 +371,7 @@ class Squeezy:
         Returns:
             Server IP address string, or None if no server found.
         """
-        return server_connection.ServerConnection.discover_lms(SLIMPROTO_PORT)
+        return server_connection.ServerConnection.discover_lms(slimproto.SLIMPROTO_PORT)
 
     def _send(self, data):
         """Send a raw packet to LMS over the SlimProto TCP connection (thread-safe)."""
@@ -418,12 +398,12 @@ class Squeezy:
             log.debug("STAT %s [%s] \"%s\" - %s (frames=%d bytes=%d)",
                       event, self._format_elapsed(elapsed), title, state,
                       self.output_frames, self.stream_bytes)
-        pkt = build_stat(
+        pkt = slimproto.build_stat(
             event,
-            stream_buf_size=STREAM_BUF_MAX,
+            stream_buf_size=slimproto.STREAM_BUF_MAX,
             stream_buf_full=self.pcm_buf.available(),
             bytes_received=self.stream_bytes,
-            output_buf_size=self.current_sample_rate * BYTES_PER_FRAME * 10,
+            output_buf_size=self.current_sample_rate * slimproto.BYTES_PER_FRAME * 10,
             output_buf_full=self.pcm_buf.available(),
             elapsed_ms=elapsed,
             server_timestamp=server_timestamp,
@@ -444,7 +424,7 @@ class Squeezy:
         device buffer depth from frames_played so LMS knows what the user
         *hears*, not what we've fed to the audio device.
 
-        We use a fixed delay estimate (DEVICE_BUFFER_MSEC + pipeline_latency)
+        We use a fixed delay estimate (DEVICE_BUFFER_MSEC + pipeline_latency_msec)
         rather than a dynamic wall-clock measurement, because the dynamic
         approach introduces jitter of 10-50ms per heartbeat. That jitter
         triggers LMS's sync adjustment logic, causing audible skips in
@@ -461,7 +441,7 @@ class Squeezy:
             return 0
 
         # Fixed device delay: miniaudio buffer + OS audio pipeline
-        device_delay_frames = self.current_sample_rate * (DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
+        device_delay_frames = self.current_sample_rate * (slimproto.DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
 
         frames = max(0, frames_in_track - device_delay_frames)
         return int(frames * 1000 / self.current_sample_rate)
@@ -481,18 +461,18 @@ class Squeezy:
                 log.error("No server found")
                 return False
 
-        log.info("Connecting to %s:%d", self.server_ip, SLIMPROTO_PORT)
+        log.info("Connecting to %s:%d", self.server_ip, slimproto.SLIMPROTO_PORT)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(slimproto.CONNECT_TIMEOUT_SEC)
         try:
-            self.sock.connect((self.server_ip, SLIMPROTO_PORT))
+            self.sock.connect((self.server_ip, slimproto.SLIMPROTO_PORT))
         except OSError as e:
             log.error("Connection failed: %s", e)
             return False
 
         self.sock.settimeout(slimproto.RECV_TIMEOUT_SEC)
 
-        helo = build_helo(self.mac, self._capabilities(), reconnect=self.reconnect,
+        helo = slimproto.build_helo(self.mac, self._capabilities(), reconnect=self.reconnect,
                           bytes_received=self.stream_bytes)
         self._send(helo)
         self.reconnect = True
@@ -606,7 +586,7 @@ class Squeezy:
             try:
                 if not self.sock:
                     return  # Socket closed by stop()
-                data = self.sock.recv(4096)
+                data = self.sock.recv(slimproto.CTRL_RECV_SIZE)
                 if not data:
                     log.info("Server closed connection")
                     return
@@ -649,247 +629,18 @@ class Squeezy:
     def _handle_message(self, msg):
         """Route a complete SlimProto message to the appropriate handler.
 
-        Messages are dispatched by their 4-byte ASCII opcode. Unknown opcodes
-        are logged at debug level and silently ignored (LMS may send opcodes
-        for features we don't implement yet).
+        Delegates to ProtocolHandler.dispatch() which owns all message parsing
+        and handler logic. See protocol/handler.py for per-opcode details.
         """
         if len(msg) < 4:
             return
-        opcode = msg[:4]
-        log.debug("Received: %s (%d bytes)", opcode, len(msg))
+        log.debug("Received: %s (%d bytes)", msg[:4], len(msg))
+        self.protocol.dispatch(msg)
 
-        handlers = {
-            b"strm": self._handle_strm,
-            b"audg": self._handle_audg,
-            b"setd": self._handle_setd,
-            b"aude": self._handle_aude,
-            b"cont": self._handle_cont,
-            b"serv": self._handle_serv,
-        }
-        handler = handlers.get(opcode)
-        if handler:
-            handler(msg)
-        else:
-            log.debug("Unhandled opcode: %s", opcode)
-
-    # --- Message handlers ---
-
-    def _handle_strm(self, msg):
-        """Handle STRM message — the main stream control command from LMS.
-
-        Dispatches to sub-handlers based on the single-character subcommand:
-            's' = start stream     'p' = pause        'u' = unpause
-            'q' = quit             'f' = flush         'a' = skip ahead
-            't' = timing request (heartbeat echo)
-        """
-        if len(msg) < 5:
-            return
-        command = chr(msg[4])
-        log.debug("strm command: %s", command)
-
-        if command == "t":
-            # Timing request - echo server timestamp
-            if len(msg) >= 22:
-                ts = struct.unpack_from(">I", msg, 18)[0]
-                self._send_stat("STMt", server_timestamp=ts)
-            else:
-                self._send_stat("STMt")
-
-        elif command == "s":
-            self._handle_strm_start(msg)
-
-        elif command == "p":
-            # Pause — replay_gain field = interval in ms (0 = immediate)
-            interval = 0
-            if len(msg) >= 22:
-                interval = struct.unpack_from(">I", msg, 18)[0]
-            if interval:
-                log.debug("Pause with interval %d ms (treating as immediate)", interval)
-            if self.playing and not self.paused:
-                self.paused = True
-                if self.device:
-                    try:
-                        self.device.close()
-                    except Exception:
-                        pass
-                    self.device = None
-            # Always confirm pause to LMS (squeezelite sends STMp regardless of interval)
-            self._send_stat("STMp")
-
-        elif command == "u":
-            # Unpause with optional sync timestamp (used for multi-room sync).
-            # Like squeezelite: if jiffies is non-zero, enter start-at-time
-            # mode (play silence until target jiffies reached, then start).
-            # If zero, start immediately.
-            target_jiffies = 0
-            if len(msg) >= 22:
-                target_jiffies = struct.unpack_from(">I", msg, 18)[0]
-
-            self.start_at_jiffies = target_jiffies
-            log.debug("unpause at: %d now: %d", target_jiffies, gettime_ms())
-            if self.paused:
-                self.paused = False
-                self._resume_audio()
-            elif not self.playing and self.pcm_buf.available() > 0:
-                # Not yet playing (e.g., sync mode: we sent STMl but LMS
-                # hadn't told us to start yet). Start audio now — the
-                # generator will output silence until start_at_jiffies.
-                if target_jiffies:
-                    self._start_audio_at_time()
-                else:
-                    self._start_audio()
-            self._send_stat("STMr")
-
-        elif command == "a":
-            # Skip ahead — replay_gain field = milliseconds to skip
-            if len(msg) >= 22:
-                skip_ms = struct.unpack_from(">I", msg, 18)[0]
-                skip_frames = int(skip_ms * self.current_sample_rate / 1000)
-                skip_bytes = skip_frames * BYTES_PER_FRAME
-                actual = self.pcm_buf.skip(skip_bytes)
-                skipped_frames = actual // BYTES_PER_FRAME
-                self.output_frames += skipped_frames
-                log.debug("Skip ahead: %d ms (%d frames requested, %d skipped)",
-                         skip_ms, skip_frames, skipped_frames)
-            self._send_stat("STMc")
-
-        elif command == "q":
-            # Quit streaming entirely — hard stop, always report completion
-            # This command tells the player to stop immediately and disconnect.
-            # We always send STMf to confirm we've stopped.
-            log.debug("Quit command: stopping playback and stream")
-            self._stop_playback()
-            self._send_stat("STMf")
-
-        elif command == "f":
-            # Flush output buffer — graceful stop that may allow track queuing
-            # This tells the player to flush the current output buffer and prepare
-            # for the next track. We only send STMf if we were actually playing.
-            # This allows for gapless transitions when a new strm-s arrives.
-            was_active = self.streaming or self.playing
-            log.debug("Flush command: stopping current playback (was_active=%s)", was_active)
-            self._stop_playback()
-            if was_active:
-                self._send_stat("STMf")
-
-    def _handle_strm_start(self, msg):
-        """Handle 'strm s' — start a new audio stream.
-
-        Parses the packet fields (codec, sample rate, threshold, replay gain,
-        crossfade params, server address, HTTP header), then either queues
-        the track for gapless transition or starts a new stream immediately.
-        """
-        # 'strm s' packet layout (all offsets are from start of payload):
-        #
-        #  off  len  field
-        #   0    4   opcode "strm"
-        #   4    1   command 's'
-        #   5    1   autostart  ASCII digit: '0'=immediate, '1'=output-buffer,
-        #                        '2'=wait-for-CONT, '3'=wait-for-CONT+output-buffer
-        #                        (sync mode uses 2 or 3; CONT decrements it by 2)
-        #   6    1   format     codec: 'm'=mp3, 'f'=flac, 'p'=pcm, 'o'=ogg,
-        #                        'a'=aac, 'w'=wma, 'l'=alac (Apple), 'e'=aac-he
-        #   7    1   pcm_sample_size  ASCII: '0'=8, '1'=16, '2'=20, '3'=24, '4'=32
-        #   8    1   pcm_sample_rate  ASCII digit index into rate table (see below)
-        #   9    1   pcm_channels     ASCII: '1'=mono, '2'=stereo
-        #  10    1   pcm_endianness   ASCII: '0'=big-endian, '1'=little-endian
-        #  11    1   threshold  output buffer threshold in 1KB units (threshold*1024)
-        #  12    1   spdif_enable
-        #  13    1   transition_period  crossfade seconds
-        #  14    1   transition_type    0=none,1=crossfade,2=fade-in,3=fade-out,4=in+out
-        #  15    1   flags
-        #  16    1   output_threshold
-        #  17    1   slaves (sync)
-        #  18    4   replay_gain  (u32, fixed-point 16.16 — 0x10000 = unity)
-        #  22    2   server_port  (u16be)
-        #  24    4   server_ip    (u32be, 0 = use slimproto server address)
-        #  28    …   http_header  raw HTTP request bytes to send to stream server
-        if len(msg) < 28:
-            log.warning("strm 's' packet too short")
-            return
-
-        self.autostart = msg[5] - ord("0") if msg[5] >= ord("0") else 0
-        fmt = chr(msg[6])
-        pcm_sample_size = msg[7]
-        pcm_sample_rate = msg[8]
-        pcm_channels = msg[9]
-        pcm_endian = msg[10]
-        threshold = msg[11] * 1024
-        # Extract replay_gain (16.16 fixed-point at offset 18)
-        if len(msg) >= 22:
-            replay_gain_raw = struct.unpack_from(">I", msg, 18)[0]
-            self.replay_gain = replay_gain_raw / 0x10000 if replay_gain_raw else 1.0
-        else:
-            self.replay_gain = 1.0  # Default if packet too short
-
-        # Extract transition parameters (offsets 13-14) for crossfade support
-        if len(msg) >= 15:
-            transition_period_raw = msg[13]
-            transition_type_raw = msg[14]
-            # Convert ASCII digits to integers (bytes 0x30-0x39 map to 0-9)
-            self.transition_period_sec = transition_period_raw - ord("0") if transition_period_raw >= ord("0") else 0
-            self.transition_type = transition_type_raw - ord("0") if transition_type_raw >= ord("0") else 0
-        else:
-            self.transition_type = 0
-            self.transition_period_sec = 0
-        log.debug("Transition: type=%d period=%ds", self.transition_type, self.transition_period_sec)
-
-        server_port = struct.unpack_from(">H", msg, 22)[0]
-        server_ip_raw = struct.unpack_from(">I", msg, 24)[0]
-        http_header = msg[28:]
-
-        # server_ip == 0 means "same host as the LMS slimproto connection"
-        if server_ip_raw == 0:
-            server_ip = self.server_ip
-        else:
-            server_ip = socket.inet_ntoa(struct.pack(">I", server_ip_raw))
-
-        # PCM format fields use ASCII digit encoding from squeezelite's pcm.c.
-        # They're only meaningful when fmt == 'p' (raw PCM); for compressed
-        # formats (mp3, flac, etc.) ffmpeg auto-detects from the stream.
-        pcm_info = None
-        if fmt == "p":
-            bits = slimproto.PCM_SAMPLE_SIZE_MAP.get(pcm_sample_size, 16)
-            rate_idx = pcm_sample_rate - ord("0") if pcm_sample_rate >= ord("0") else 0
-            rate = slimproto.PCM_RATE_TABLE[rate_idx] if rate_idx < len(slimproto.PCM_RATE_TABLE) else SAMPLE_RATE
-            chans = pcm_channels - ord("0") if pcm_channels >= ord("0") else 2
-            if chans not in (1, 2):
-                chans = 2
-            endian = "le" if pcm_endian == ord("1") else "be"
-            pcm_info = {"bits": bits, "rate": rate, "channels": chans, "endian": endian}
-
-        # Detect sample rate for this stream (variable sample rate support)
-        if fmt == "p" and pcm_info:
-            self.next_sample_rate = self._get_supported_rate(pcm_info["rate"])
-        else:
-            # For compressed formats, will detect from ffmpeg output later
-            self.next_sample_rate = 44100  # Default, may be updated by ffmpeg detection
-
-        log.debug("Stream start: format=%s server=%s:%d threshold=%d autostart=%d replay_gain=%.2f pcm=%s",
-                  fmt, server_ip, server_port, threshold, self.autostart, self.replay_gain, pcm_info)
-
-        stream_args = (server_ip, server_port, http_header, threshold, self.autostart, fmt, pcm_info)
-
-        # Like squeezelite: if audio is still playing from the previous track
-        # (decode done, buffer draining), don't kill the output — queue the
-        # next track and let the current one finish.
-        if self.playing and self.decode_complete:
-            log.debug("Track still playing — queuing next track for gapless transition")
-            self._pending_track = stream_args
-            self._send_stat("STMf")
-            # Stop the old *stream* (network) but keep the audio device running
-            self.streaming = False
-            if self.stream_sock:
-                try:
-                    self.stream_sock.close()
-                except Exception:
-                    pass
-            return
-
-        # Stop any existing playback
-        self._stop_playback()
-        self._send_stat("STMf")
-        self._start_stream(stream_args)
+    # --- Message handlers (delegated to protocol/handler.py) ---
+    # All strm/audg/setd/aude/cont/serv/dsco handling lives in ProtocolHandler.
+    # The handler calls back into methods below (_start_stream, _start_audio,
+    # _resume_audio, _stop_playback, etc.) for state transitions.
 
     def _start_stream(self, stream_args):
         """Begin streaming a new track.
@@ -974,88 +725,6 @@ class Squeezy:
             self._stop_playback()
             self._start_stream(args)
 
-    def _handle_audg(self, msg):
-        """Handle AUDG message — volume control from LMS remote.
-
-        The gain value is a 16.16 fixed-point number where 0x10000 = 1.0 (unity).
-        We use the left channel gain as a mono volume multiplier, capped at 1.0.
-        Only applied when the 'adjust' flag (byte 12) is set.
-        """
-        if len(msg) >= 22:
-            adjust = msg[12]
-            gain_l = struct.unpack_from(">I", msg, 14)[0]
-            gain_r = struct.unpack_from(">I", msg, 18)[0]
-            # Use left channel gain as volume (mono mix); max gain is 0x10000 = 1.0
-            self.volume = min(gain_l / 0x10000, 1.0) if adjust else 1.0
-            log.debug("Volume: %.0f%% (L=%.2f R=%.2f adjust=%d)",
-                      self.volume * 100, gain_l / 0x10000, gain_r / 0x10000, adjust)
-
-    def _handle_setd(self, msg):
-        """Handle SETD message — get/set player data (currently just player name).
-
-        When LMS sends SETD with id=0 and no payload, it's a query — we respond
-        with our current name. When it includes a payload, it's a set — we update
-        the name and persist it to disk.
-        """
-        if len(msg) < 5:
-            return
-        setd_id = msg[4]
-        if setd_id == slimproto.SETD_ID_PLAYER_NAME:
-            if len(msg) == 5:
-                # Query player name
-                name_data = self.name.encode("utf-8") + b"\x00"
-                self._send(build_setd(slimproto.SETD_ID_PLAYER_NAME, name_data))
-            elif len(msg) > 5:
-                # Set player name
-                new_name = msg[5:].rstrip(b"\x00").decode("utf-8", errors="replace")
-                if new_name:
-                    self.name = new_name
-                    self._save_player_name(new_name)  # Persist to file
-                    log.info("Player name set to: %s", self.name)
-                name_data = self.name.encode("utf-8") + b"\x00"
-                self._send(build_setd(slimproto.SETD_ID_PLAYER_NAME, name_data))
-
-    def _handle_aude(self, msg):
-        """Handle AUDE message — audio enable/disable (no-op).
-
-        LMS sends this to enable/disable audio codecs. We don't need to act
-        on it since our codec support is static (determined at startup by
-        probing ffmpeg).
-        """
-        log.debug("aude received")
-
-    def _handle_cont(self, msg):
-        """Handle CONT (continuation) packet for sync group playback and metaint updates.
-
-        CONT packet format (from squeezelite slimproto.c:399-415):
-        - Used for synchronized playback (autostart >= 2)
-        - May include metaint field for ICY metadata interval
-        """
-        log.debug("cont received (autostart was %d)", self.autostart)
-        if self.autostart >= 2:
-            self.autostart -= 2
-            self.cont_received = True
-
-        # Extract metaint from CONT packet if present (for ICY metadata support)
-        # CONT packet may include metaint at offset 4 (u32 big-endian)
-        if len(msg) >= 8:
-            metaint = struct.unpack_from(">I", msg, 4)[0]
-            if metaint > 0:
-                self.icy_meta_int = metaint
-                log.debug("CONT metaint updated to %d bytes", metaint)
-
-    def _handle_serv(self, msg):
-        """Handle SERV message — server redirect.
-
-        LMS sends this when migrating players between server instances. We
-        update our server_ip so the next reconnect goes to the new server.
-        """
-        if len(msg) >= 8:
-            new_ip = struct.unpack_from(">I", msg, 4)[0]
-            if new_ip:
-                self.server_ip = socket.inet_ntoa(struct.pack(">I", new_ip))
-                log.info("Server redirect to %s", self.server_ip)
-
     # --- Status Reporting ---
 
     def _query_lms_track_info(self):
@@ -1128,53 +797,30 @@ class Squeezy:
         return lms_metadata.query_fields(self.server_ip, player_id, fields)
 
     def _parse_icy_metadata(self, data):
-        """Parse ICY metadata block and extract title, artist, album.
+        """Parse ICY metadata block and update track info.
 
-        ICY metadata format: 1 byte length (in 16-byte units), then length*16 bytes
-        of key=value pairs separated by semicolons.
-        Example: b"StreamTitle='Song Name';StreamUrl='...';StreamArtist='Artist';"
+        Delegates to metadata.parse_icy_metadata() for the actual parsing,
+        then updates instance state with the extracted title/artist/album.
 
-        Returns True if title changed.
+        Args:
+            data: Raw metadata block (bytes, starting with 1-byte length field)
+
+        Returns:
+            True if the title changed, False otherwise
         """
-        if len(data) < 1:
-            return False
+        result = metadata.parse_icy_metadata(data)
+        title_changed = False
 
-        meta_len = data[0]
-        if meta_len == 0:
-            return False
+        if result["title"] and result["title"] != self.icy_title:
+            self.icy_title = result["title"]
+            log.info("Track: %s (from ICY metadata)", result["title"])
+            title_changed = True
+        if result["artist"]:
+            self.icy_artist = result["artist"]
+        if result["album"]:
+            self.icy_album = result["album"]
 
-        meta_bytes = meta_len * 16
-        if len(data) < 1 + meta_bytes:
-            return False
-
-        try:
-            meta_str = data[1:1+meta_bytes].decode("utf-8", errors="ignore").rstrip("\x00")
-            title_changed = False
-
-            # Parse key=value pairs
-            for pair in meta_str.split(";"):
-                pair = pair.strip()
-                if "=" not in pair:
-                    continue
-                key, val = pair.split("=", 1)
-                key = key.strip().lower()
-                # Remove quotes if present
-                val = val.strip().strip("'\"")
-
-                if key == "streamtitle":
-                    if val != self.icy_title:
-                        self.icy_title = val
-                        log.info("Track: %s (from: ICY metadata)", val)
-                        title_changed = True
-                elif key == "streamartist":
-                    self.icy_artist = val
-                elif key == "streamalbum":
-                    self.icy_album = val
-
-            return title_changed
-        except Exception as e:
-            log.debug("ICY metadata parse error: %s", e)
-            return False
+        return title_changed
 
     def _status_dict(self):
         """Return current playback status as a dictionary for the status socket.
@@ -1217,7 +863,7 @@ class Squeezy:
             self._cleanup_ffmpeg()
             if self.running:
                 try:
-                    self._send(build_dsco(0))
+                    self._send(slimproto.build_dsco(0))
                 except Exception:
                     pass
 
@@ -1282,14 +928,14 @@ class Squeezy:
             pass
 
         # Send RESP and STMc
-        self._send(build_resp(resp_headers))
+        self._send(slimproto.build_resp(resp_headers))
         self._send_stat("STMc")
 
         # For raw PCM at our native format, skip ffmpeg entirely
         pcm_passthrough = (fmt == "p" and pcm_info
                            and pcm_info["bits"] == 16 and pcm_info["endian"] == "le"
-                           and pcm_info["rate"] == SAMPLE_RATE
-                           and pcm_info["channels"] == CHANNELS)
+                           and pcm_info["rate"] == slimproto.SAMPLE_RATE
+                           and pcm_info["channels"] == slimproto.CHANNELS)
 
         if pcm_passthrough:
             log.debug("PCM passthrough (no ffmpeg needed)")
@@ -1303,7 +949,7 @@ class Squeezy:
                                "-ar", str(pcm_info["rate"]),
                                "-ac", str(pcm_info["channels"])]
             ffmpeg_cmd += ["-i", "pipe:0",
-                           "-f", "s16le", "-ar", str(self.next_sample_rate), "-ac", str(CHANNELS),
+                           "-f", "s16le", "-ar", str(self.next_sample_rate), "-ac", str(slimproto.CHANNELS),
                            "pipe:1"]
             log.debug("ffmpeg command: %s", " ".join(ffmpeg_cmd))
 
@@ -1684,7 +1330,7 @@ class Squeezy:
         """Generator that yields PCM data to the miniaudio playback device.
 
         miniaudio calls send(framecount) on this generator from its callback
-        thread, and we yield exactly framecount * BYTES_PER_FRAME bytes back.
+        thread, and we yield exactly framecount * slimproto.BYTES_PER_FRAME bytes back.
 
         This generator is the heart of the audio pipeline. It handles:
         - Silence during pause and sync-wait periods
@@ -1703,15 +1349,15 @@ class Squeezy:
         required_frames = yield b""  # priming yield
         while self.playing and self.running:
             if self.paused:
-                required_frames = yield b"\x00" * (required_frames * BYTES_PER_FRAME)
+                required_frames = yield b"\x00" * (required_frames * slimproto.BYTES_PER_FRAME)
                 continue
 
-            required_bytes = required_frames * BYTES_PER_FRAME
+            required_bytes = required_frames * slimproto.BYTES_PER_FRAME
 
             # Sync: if start_at_jiffies is set, output silence until target time
             # (like squeezelite's OUTPUT_START_AT state)
             if self.start_at_jiffies:
-                now = gettime_ms()
+                now = slimproto.gettime_ms()
                 # 32-bit unsigned subtraction with wrap-around handling:
                 # - Mask to u32 range (& 0xFFFFFFFF)
                 # - diff < JIFFIES_WRAP_GUARD: target is in the future (not wrapped past)
@@ -1743,7 +1389,7 @@ class Squeezy:
                     if self._device_start_time is None:
                         self._device_start_time = time.monotonic()
                         self._device_start_frames = self.output_frames
-                    self.output_frames += len(chunk) // BYTES_PER_FRAME
+                    self.output_frames += len(chunk) // slimproto.BYTES_PER_FRAME
                     # Crossfade tail accumulation: while the old track is draining
                     # (decode done, next track queued), save the last N seconds of
                     # audio. This becomes the "old side" of the crossfade mix when
@@ -1755,7 +1401,7 @@ class Squeezy:
                     if self.decode_complete and self.transition_type > 0 and self._pending_track:
                         self._crossfade_samples.extend(chunk)
                         # Cap to transition_period worth of audio (sliding window)
-                        max_bytes = int(self.transition_period_sec * self.current_sample_rate * BYTES_PER_FRAME)
+                        max_bytes = int(self.transition_period_sec * self.current_sample_rate * slimproto.BYTES_PER_FRAME)
                         if len(self._crossfade_samples) > max_bytes:
                             self._crossfade_samples = self._crossfade_samples[-max_bytes:]
                     if len(chunk) < required_bytes:
@@ -1862,13 +1508,13 @@ class Squeezy:
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=CHANNELS,
+                nchannels=slimproto.CHANNELS,
                 sample_rate=self.current_sample_rate,
-                buffersize_msec=DEVICE_BUFFER_MSEC,
+                buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
             log.debug("Audio device buffer: %dms (requested %dms)",
-                      self.device.buffersize_msec, DEVICE_BUFFER_MSEC)
+                      self.device.buffersize_msec, slimproto.DEVICE_BUFFER_MSEC)
             self.playing = True  # Set before start() — generator checks this immediately
             self.paused = False
             self.output_frames = 0
@@ -1883,7 +1529,7 @@ class Squeezy:
     def _start_audio_at_time(self):
         """Start audio device immediately but output silence until sync timestamp.
         The generator handles the silence-until-time logic (OUTPUT_START_AT equivalent)."""
-        log.debug("Sync start at jiffies=%d (now=%d)", self.start_at_jiffies, gettime_ms())
+        log.debug("Sync start at jiffies=%d (now=%d)", self.start_at_jiffies, slimproto.gettime_ms())
         self._start_audio()
 
     def _resume_audio(self, sample_rate=None):
@@ -1919,9 +1565,9 @@ class Squeezy:
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=CHANNELS,
+                nchannels=slimproto.CHANNELS,
                 sample_rate=self.current_sample_rate,
-                buffersize_msec=DEVICE_BUFFER_MSEC,
+                buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
             gen = self._audio_generator()
@@ -2077,7 +1723,7 @@ def main():
     parser.add_argument("-d", "--device", help="Audio output device (name or substring, e.g. 'HDMI')")
     parser.add_argument("-l", "--list-devices", action="store_true", help="List audio output devices and exit")
     parser.add_argument("--latency", type=int, default=None, metavar="MS",
-                        help=f"OS audio pipeline latency in ms (default: {PLATFORM_PIPELINE_MSEC}ms on this platform). "
+                        help=f"OS audio pipeline latency in ms (default: {slimproto.PLATFORM_PIPELINE_MSEC}ms on this platform). "
                              "Increase if sync is behind, decrease if ahead.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase verbosity (-v info, -vv debug)")

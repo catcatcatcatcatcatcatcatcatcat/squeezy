@@ -88,10 +88,17 @@ UDP_DISCOVER_RESPONSE = b"E"    # LMS replies with this prefix
 # HTTPS detection
 HTTPS_PORT = 443                 # Port that triggers SSL wrapping
 
+# 16.16 fixed-point format used for volume and replay gain values.
+# Both AUDG (volume) and strm-s (replay gain) encode gain as:
+#   upper 16 bits = integer part, lower 16 bits = fractional part
+# So 0x10000 = 1.0 (unity gain), 0x8000 = 0.5 (-6dB)
+GAIN_FIXED_POINT_ONE = 0x10000
+
 # ---------------------------------------------------------------------------
 # Streaming buffer constants
 # ---------------------------------------------------------------------------
 
+CTRL_RECV_SIZE = 4096            # Recv size for SlimProto control channel messages
 HTTP_HEADER_RECV_SIZE = 4096     # Recv size for reading HTTP response headers
 STREAM_RECV_SIZE = 32768         # Recv size for streaming audio data (32 KB)
 FFMPEG_READ_SIZE = 8192          # Chunk size for reading ffmpeg stdout (8 KB)
@@ -247,8 +254,10 @@ def default_mac():
     return node.to_bytes(6, "big")
 
 
-def encode_replay_gain(gain_float):
+def encode_fixed_point_gain(gain_float):
     """Encode a floating-point gain value to 16.16 fixed-point format.
+
+    Used for both volume (AUDG) and replay gain (strm-s) values.
 
     Args:
         gain_float: Gain multiplier (1.0 = unity gain)
@@ -256,12 +265,13 @@ def encode_replay_gain(gain_float):
     Returns:
         32-bit unsigned integer in 16.16 fixed-point format
     """
-    return int(round(gain_float * 0x10000)) & 0xFFFFFFFF
+    return int(round(gain_float * GAIN_FIXED_POINT_ONE)) & 0xFFFFFFFF
 
 
-def decode_replay_gain(gain_raw):
-    """Decode a 16.16 fixed-point replay gain value to float.
+def decode_fixed_point_gain(gain_raw):
+    """Decode a 16.16 fixed-point gain value to float.
 
+    Used for both volume (AUDG) and replay gain (strm-s) values.
     The format is: upper 16 bits = integer part, lower 16 bits = fractional part.
     Example: 0x10000 = 1.0 (unity gain), 0x8000 = 0.5 (-6dB)
 
@@ -271,7 +281,7 @@ def decode_replay_gain(gain_raw):
     Returns:
         Floating-point gain multiplier
     """
-    return gain_raw / 0x10000
+    return gain_raw / GAIN_FIXED_POINT_ONE
 
 
 # ---------------------------------------------------------------------------

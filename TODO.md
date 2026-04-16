@@ -12,11 +12,9 @@ learned from studying squeezelite's codebase and 530+ commits / 260+ GitHub issu
 ## Completion Status
 
 ✅ **Priority 1** (8/8) — Critical Reliability — COMPLETE
-✅ **Priority 2** (9/11) — User-Facing Quality — 9/11 COMPLETE
-   - ⏸️ P2.6 (24-bit audio) — Deferred (requires full refactor)
-   - ⏭️ P2.8 (Hardware volume) — Skipped (platform-specific)
+✅ **Priority 2** (9/11) — User-Facing Quality — 9 COMPLETE, 2 deferred (see BACKLOG.md)
 ⏳ **Priority 3** (7/13) — Robustness & Edge Cases — 7 COMPLETE, 6 remaining
-⏳ **Priority 4** (0/5) — Platform-Specific — NOT STARTED
+⏳ **Priority 4** (2/5) — Platform-Specific — 3 deferred (see BACKLOG.md)
 ⏳ **Priority 5** (0/4) — Performance Optimizations — NOT STARTED
 
 ---
@@ -48,51 +46,6 @@ src/squeezy/
 - **network/**: TCP/UDP sockets, server discovery, LMS metadata queries, status server
 - **config/**: Configuration persistence, ICY/LAME metadata extraction
 - **squeezy.py**: Audio device lifecycle, streaming pipeline, CLI, main event loop
-
----
-
-## Priority 2 — Deferred/Skipped Features
-
-### 2.6 24-bit and 32-bit Audio
-
-**STATUS: ⏸️ DEFERRED (Future enhancement)**
-
-**Problem:** Many high-quality music files and streams use 24-bit or 32-bit audio.
-Without support, squeezy truncates to 16-bit, losing quality.
-
-**How squeezelite handles it:**
-Squeezelite supports native 24-bit and 32-bit output on platforms that have it
-(ALSA on Linux, Coreaudio on macOS). The STAT packet includes `output_rate_mode` field
-that tells LMS whether we want 16-bit, 24-bit, or 32-bit frames.
-
-**Why deferred:**
-This requires:
-1. Detecting 24/32-bit streams from FFmpeg output or HTTP headers
-2. Updating miniaudio device initialization to request 24/32-bit format
-3. Updating PCMBuffer sample size from fixed 16-bit to variable
-4. Updating audio generator to handle 24/32-bit frames
-5. Testing across macOS/Linux/Windows with various audio devices
-
-Implementation likely requires significant refactoring of the audio pipeline.
-**Estimated effort: 3-4 sessions** once current P1/P2 are fully stabilized.
-
----
-
-### 2.8 Hardware Volume / OS Mixer Control
-
-**STATUS: ⏭️ SKIPPED (platform-specific complexity)**
-
-**Problem:** Some users want to control speaker volume via LMS instead of physical knobs.
-Without `audg` packet response support, this doesn't work.
-
-**Why skipped:**
-- macOS: CoreAudio requires low-level device enumeration + HAL
-- Linux: ALSA mixer configuration is device-dependent
-- Windows: WinMM/WASAPI APIs are complex
-- ffmpeg: Volume control is non-standard output option
-
-Each platform needs different code. This doesn't provide much value for a software
-player where OS volume control already works. **Better to let users adjust via OS mixer.**
 
 ---
 
@@ -188,8 +141,6 @@ EOF correctly when FFmpeg closes stdout.
 
 ---
 
----
-
 ### 3.8 Circular Buffer (Ring Buffer)
 
 **Problem:** If PCMBuffer has a subtle edge case (write wrapping around, read blocking
@@ -209,8 +160,6 @@ Add unit tests in `test_p3_robustness.py` for PCMBuffer edge cases.
 
 ---
 
----
-
 ## Priority 4 — Platform-Specific
 
 ### 4.1 Linux ALSA Device Issues
@@ -223,16 +172,6 @@ Add fallback device list if enumeration fails. Pre-populate "default", "pulse", 
 
 ---
 
-### 4.2 macOS CoreAudio Device Switching
-
-**Problem:** Changing audio output (e.g., unplugging headphones) requires CoreAudio
-event handling.
-
-**Suggested fix:**
-Listen for macOS audio device change notifications and reinitialize miniaudio device.
-
----
-
 ### 4.3 Windows WaveOut / WASAPI Issues
 
 **Problem:** Windows WaveOut can have unpredictable latency. WASAPI is more reliable
@@ -240,24 +179,6 @@ but more complex.
 
 **Suggested fix:**
 If miniaudio supports WASAPI backend selection, use it. Otherwise accept WaveOut quirks.
-
----
-
-### 4.4 Systemd / systemctl Integration
-
-**Problem:** Some users want to run squeezy as a systemd service with automatic restart.
-
-**Suggested fix:**
-Document systemd unit file and installation instructions.
-
----
-
-### 4.5 Docker / Container Support
-
-**Problem:** Running squeezy in a container requires careful PulseAudio/ALSA configuration.
-
-**Suggested fix:**
-Document Docker setup with audio device pass-through and volume mounting.
 
 ---
 

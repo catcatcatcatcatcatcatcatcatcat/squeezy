@@ -9,13 +9,19 @@ import logging
 import socket
 import threading
 
+from ..protocol import slimproto
+
 log = logging.getLogger("squeezy")
 
 
 class ServerConnection:
-    """TCP connection to LMS with UDP discovery fallback."""
+    """TCP connection to LMS with UDP discovery fallback.
 
-    def __init__(self, port: int = 3483, timeout_sec: float = 1.0):
+    Manages the SlimProto TCP socket used for the main control channel.
+    Also provides static UDP discovery to find LMS on the local network.
+    """
+
+    def __init__(self, port=slimproto.SLIMPROTO_PORT, timeout_sec=slimproto.RECV_TIMEOUT_SEC):
         """Initialize connection manager.
 
         Args:
@@ -28,24 +34,26 @@ class ServerConnection:
         self._send_lock = threading.Lock()
 
     @staticmethod
-    def discover_lms(port: int = 3483) -> str:
-        """Discover LMS via UDP broadcast.
+    def discover_lms(port=slimproto.SLIMPROTO_PORT):
+        """Discover LMS on the local network via UDP broadcast.
 
-        Sends "e" probe on port 3483 and listens for "E" response with server IP.
-        Tries 255.255.255.255 plus interface-specific and common subnet broadcasts.
+        Sends a single-byte probe ('e') on the SlimProto port and listens
+        for the LMS response ('E' prefix + server info). Tries multiple
+        broadcast addresses because 255.255.255.255 fails on some macOS
+        network configurations (bridged interfaces, VPNs).
 
         Args:
-            port: SlimProto UDP port
+            port: SlimProto UDP port to probe
 
         Returns:
-            Server IP address (string), or None if not found
+            Server IP address (string), or None if not found after all attempts
         """
         log.info("Discovering server...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(5)
+        sock.settimeout(slimproto.DISCOVERY_TIMEOUT_SEC)
 
-        # Try multiple broadcast addresses (255.255.255.255 fails on some macOS configs)
+        # Build list of broadcast addresses to try
         broadcast_addrs = ["255.255.255.255"]
         try:
             import netifaces
@@ -55,18 +63,19 @@ class ServerConnection:
                     if "broadcast" in addr:
                         broadcast_addrs.append(addr["broadcast"])
         except ImportError:
-            # Fallback: try common subnet broadcasts
-            broadcast_addrs.extend(["192.168.1.255", "192.168.0.255", "10.0.0.255", "172.16.0.255"])
+            # netifaces not installed — try common subnet broadcasts
+            broadcast_addrs.extend(["192.168.1.255", "192.168.0.255",
+                                    "10.0.0.255", "172.16.0.255"])
 
-        for attempt in range(5):
+        for attempt in range(slimproto.DISCOVERY_ATTEMPTS):
             for bcast in broadcast_addrs:
                 try:
-                    sock.sendto(b"e", (bcast, port))
+                    sock.sendto(slimproto.UDP_DISCOVER_PROBE, (bcast, port))
                 except OSError:
                     continue
             try:
-                data, addr = sock.recvfrom(1024)
-                if data and data[0:1] == b"E":
+                data, addr = sock.recvfrom(slimproto.DISCOVERY_RECV_SIZE)
+                if data and data[0:1] == slimproto.UDP_DISCOVER_RESPONSE:
                     log.info("Found server at %s", addr[0])
                     sock.close()
                     return addr[0]

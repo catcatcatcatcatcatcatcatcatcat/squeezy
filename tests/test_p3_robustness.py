@@ -241,6 +241,94 @@ class TestP37MemoryManagement:
         assert len(received) == total_bytes, f"Lost {total_bytes - len(received)} bytes"
         assert bytes(received) == source, "Data corruption: bytes received don't match bytes sent"
 
+    def test_buffer_skip(self):
+        """skip() discards bytes and frees space for writers."""
+        buf = PCMBuffer(max_size=100)
+        buf.write(b"\xAA" * 80)
+        skipped = buf.skip(30)
+        assert skipped == 30
+        assert buf.available() == 50
+        # Remaining data is correct (the last 50 bytes)
+        data = buf.read(50)
+        assert data == b"\xAA" * 50
+
+    def test_buffer_skip_more_than_available(self):
+        """skip() with n > available skips only what's there."""
+        buf = PCMBuffer(max_size=100)
+        buf.write(b"\xBB" * 40)
+        skipped = buf.skip(100)
+        assert skipped == 40
+        assert buf.available() == 0
+
+    def test_buffer_skip_empty(self):
+        """skip() on empty buffer returns 0."""
+        buf = PCMBuffer(max_size=100)
+        assert buf.skip(10) == 0
+
+    def test_buffer_skip_unblocks_writer(self):
+        """skip() frees space and unblocks a waiting writer."""
+        import threading
+        import time
+        buf = PCMBuffer(max_size=100)
+        buf.write(b"\x00" * 100)
+        results = []
+
+        def writer():
+            written = buf.write(b"\x00" * 20)
+            results.append(written)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        time.sleep(0.05)
+        assert t.is_alive()  # Blocked — buffer full
+        buf.skip(30)  # Free space via skip
+        t.join(timeout=1)
+        assert not t.is_alive()
+        assert results[0] == 20
+
+    def test_buffer_flush_unblocks_writer(self):
+        """flush() clears buffer and unblocks a waiting writer."""
+        import threading
+        import time
+        buf = PCMBuffer(max_size=100)
+        buf.write(b"\x00" * 100)
+        results = []
+
+        def writer():
+            written = buf.write(b"\xFF" * 50)
+            results.append(written)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        time.sleep(0.05)
+        assert t.is_alive()  # Blocked
+        buf.flush()  # Clear everything
+        t.join(timeout=1)
+        assert not t.is_alive()
+        assert results[0] == 50
+        assert buf.available() == 50
+
+    def test_buffer_flush_resets_closed(self):
+        """flush() resets the closed flag so writes work again."""
+        buf = PCMBuffer(max_size=100)
+        buf.close()
+        buf.flush()
+        written = buf.write(b"\x00" * 50)
+        assert written == 50
+
+    def test_buffer_read_empty(self):
+        """read() on empty buffer returns empty bytes."""
+        buf = PCMBuffer(max_size=100)
+        assert buf.read(10) == b""
+
+    def test_buffer_read_partial(self):
+        """read() returns less than n if buffer has less."""
+        buf = PCMBuffer(max_size=100)
+        buf.write(b"\xCC" * 30)
+        data = buf.read(50)
+        assert len(data) == 30
+        assert data == b"\xCC" * 30
+
     def test_elapsed_time_stable_after_resume(self):
         """Elapsed time should not jump after pause/resume.
 

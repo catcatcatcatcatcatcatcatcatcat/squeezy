@@ -11,21 +11,22 @@ or this codebase.
 ```
 squeezy/
 ├── src/squeezy/                ← the player (modular package)
-│   ├── squeezy.py              ← main orchestrator (~1,990 lines)
+│   ├── squeezy.py              ← main orchestrator (~1,780 lines)
 │   ├── __init__.py             ← package marker
 │   ├── __main__.py             ← enables `python -m squeezy`
 │   ├── audio/
-│   │   ├── player.py           ← miniaudio device, mixing, crossfade
-│   │   └── stream_decoder.py   ← HTTP streaming, FFmpeg, PCMBuffer
+│   │   └── stream_decoder.py   ← thread-safe PCMBuffer
 │   ├── protocol/
-│   │   ├── handler.py          ← message dispatch (strm, cont, audg, serv, aude)
+│   │   ├── handler.py          ← SlimProto message handlers (strm, audg, setd, etc.)
 │   │   ├── slimproto.py        ← protocol constants & packet builders
 │   │   └── lms_client.py       ← LMS message operations (HELO, STAT, DSCO)
 │   ├── network/
-│   │   └── server_connection.py ← TCP/UDP socket management, discovery
+│   │   ├── server_connection.py ← TCP/UDP socket management, discovery
+│   │   ├── lms_metadata.py     ← LMS JSON-RPC track metadata queries
+│   │   └── status_server.py    ← Unix socket status server for external tools
 │   └── config/
 │       ├── config.py           ← XDG-compliant config persistence
-│       └── metadata.py         ← ICY metadata parsing
+│       └── metadata.py         ← ICY metadata & LAME gapless parsing
 │
 ├── run.sh                  ← dev runner (no install needed)
 ├── pyproject.toml          ← single source of truth: version, deps, metadata
@@ -59,37 +60,38 @@ squeezy/
 
 ### Module structure
 
-The codebase is organized into 8 focused modules with clear layer dependencies:
+The codebase is organized into focused modules with clear layer dependencies:
 
 | Module | Lines | Responsibility |
 |--------|-------|---------------|
-| `protocol/slimproto.py` | 278 | Protocol constants, packet builders, format strings |
+| `protocol/slimproto.py` | ~400 | Protocol constants, packet builders, utility functions |
 | `config/config.py` | 69 | XDG config directory, player name persistence |
-| `config/metadata.py` | 89 | ICY/Shoutcast metadata parsing |
-| `network/server_connection.py` | 139 | TCP connection, UDP discovery |
+| `config/metadata.py` | ~180 | ICY/Shoutcast metadata parsing, LAME gapless info |
+| `network/server_connection.py` | ~150 | TCP connection, UDP discovery |
+| `network/lms_metadata.py` | 83 | LMS JSON-RPC track metadata queries |
+| `network/status_server.py` | 126 | Unix socket status server for external tools |
 | `protocol/lms_client.py` | 122 | SlimProto message sending (HELO, STAT, DSCO) |
-| `protocol/handler.py` | 299 | Message dispatch & parameter extraction |
-| `audio/player.py` | 285 | miniaudio device, crossfade, gain, elapsed time |
-| `audio/stream_decoder.py` | 450 | HTTP fetch, FFmpeg subprocess, PCMBuffer |
-| `squeezy.py` | ~1,990 | Main orchestrator, CLI, main loop, state management |
+| `protocol/handler.py` | ~420 | SlimProto message handlers (strm, audg, setd, cont, etc.) |
+| `audio/stream_decoder.py` | ~140 | Thread-safe PCMBuffer |
+| `squeezy.py` | ~1,780 | Main orchestrator, CLI, audio pipeline, state management |
 
 ### `squeezy.py` — Main orchestrator
 
-The central coordinator (~1,990 lines). Imports and wires together all modules.
+The central coordinator (~1,780 lines). Imports and wires together all modules.
+Protocol message handling is delegated to `protocol/handler.py`.
 
 Key sections:
 
 | Section | What it does |
 |---------|-------------|
-| Constants (top) | Re-exports from `slimproto`: `SAMPLE_RATE`, `CHANNELS`, `DEVICE_BUFFER_MSEC`, etc. |
-| `class Squeezy` | The player — connects to LMS, handles all protocol messages, drives audio |
-| `_handle_strm_*` | Handlers for the `strm` command family (start, stop, pause, flush, skip) |
+| `class Squeezy` | The player — connects to LMS, drives audio, owns all shared state |
+| `_message_loop` | SlimProto TCP framing, heartbeats, server timeout — delegates to `handler.py` |
 | `_stream_worker` / `_do_stream` | Downloads the HTTP audio stream in a background thread |
 | `_stream_to_buffer` | PCM passthrough path — raw PCM direct to buffer, no ffmpeg |
 | `_stream_to_ffmpeg` | Compressed audio path — feeds data to ffmpeg stdin |
 | `_decode_reader` | Reads decoded PCM from ffmpeg stdout into the buffer |
 | `_audio_generator` | Python generator yielding PCM chunks to miniaudio's callback |
-| `_elapsed_ms` | Reports playback position to LMS with dynamic device-delay compensation |
+| `_elapsed_ms` | Reports playback position to LMS with fixed device-delay compensation |
 | `discover` / `connect` | UDP server discovery and TCP SlimProto connection |
 | `main` | CLI entry point — argument parsing, logging setup, player lifecycle |
 
@@ -181,7 +183,7 @@ docker run --rm --network container:squeezy-lms squeezy-dev \
 
 ### `tests/test_p3_robustness.py`
 
-18 unit tests covering Priority 3 (Robustness & Edge Cases):
+21 unit tests covering Priority 3 (Robustness & Edge Cases):
 - MP3 gapless (LAME header parsing)
 - PCMBuffer memory limits (OOM prevention)
 - DSCO disconnect packet handling

@@ -27,28 +27,30 @@ A minimal Python reimplementation of **squeezelite** — a software player for
 ## Architecture / key design decisions
 
 ### Module structure (v0.3.0+)
-The codebase is organized into 8 focused modules with clear layer dependencies:
+The codebase is organized into focused modules with clear layer dependencies:
 
 **Layer 0 (Foundation — no dependencies):**
-- `protocol/slimproto.py` (278 lines) — Protocol constants, packet builders, format strings
+- `protocol/slimproto.py` (~400 lines) — Protocol constants, packet builders, utility functions
 - `config/config.py` (69 lines) — XDG config directory management (player name persistence)
-- `config/metadata.py` (89 lines) — ICY/Shoutcast metadata parsing
+- `config/metadata.py` (~180 lines) — ICY/Shoutcast metadata parsing, LAME gapless info
 
-**Layer 1 (Protocol — foundation only):**
-- `network/server_connection.py` (139 lines) — TCP/UDP socket management, discovery
+**Layer 1 (Protocol & Network — foundation only):**
+- `network/server_connection.py` (~150 lines) — TCP/UDP socket management, discovery
+- `network/lms_metadata.py` (83 lines) — LMS JSON-RPC track metadata queries
+- `network/status_server.py` (126 lines) — Unix socket status server for external tools
 - `protocol/lms_client.py` (122 lines) — SlimProto message sending (HELO, STAT, DSCO, etc.)
 
-**Layer 2 (Audio pipeline — all previous layers):**
-- `audio/player.py` (285 lines) — miniaudio device lifecycle, mixing, crossfade, elapsed time
-- `audio/stream_decoder.py` (450 lines) — HTTP streaming, FFmpeg process, PCM buffer management
+**Layer 2 (Audio buffer):**
+- `audio/stream_decoder.py` (~140 lines) — Thread-safe PCMBuffer (bounded, backpressure)
 
-**Layer 3 (Message handlers):**
-- `protocol/handler.py` (299 lines) — Message dispatch (strm, cont, audg, serv, aude, etc.)
+**Layer 3 (Message handlers — calls back into squeezy.py for state transitions):**
+- `protocol/handler.py` (~420 lines) — All SlimProto message parsing & dispatch (strm, audg, setd, cont, serv, dsco, aude)
 
 **Main orchestration:**
-- `squeezy.py` (~1,990 lines) — Orchestrates all modules, CLI, main loop, state management
+- `squeezy.py` (~1,780 lines) — Audio pipeline, streaming, CLI, main loop, state management
 
-The modular structure enables easier testing, maintenance, and feature isolation.
+Protocol message handling is delegated to `handler.py`. Audio device management,
+streaming, and the audio generator remain in `squeezy.py`.
 
 ### Threading model
 ```
@@ -177,7 +179,7 @@ DEVICE_DELAY_MSEC = 80       # fallback static total (buffer + pipeline)
 
 ## Testing
 
-**Unit tests (73 unit + 14 integration = 87 total):**
+**Unit tests (76 unit + 14 integration = 90 total):**
 ```bash
 PYTHONPATH=src python3 -m pytest tests/                     # all unit tests
 PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 tests only
@@ -193,7 +195,7 @@ make test                                                   # shortcut (sets PYT
 **Test coverage:**
 - P1 Reliability (14 tests) — Connection, heartbeat, state management
 - P2 Features (41 tests) — Gapless, crossfade, replay gain, ICY metadata, sample rate
-- P3 Robustness (18 tests) — MP3 gapless, memory management, DSCO, graceful shutdown
+- P3 Robustness (21 tests) — MP3 gapless, memory management, DSCO, graceful shutdown
 - Integration (14 tests) — End-to-end with real LMS
 
 ---

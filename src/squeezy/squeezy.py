@@ -89,7 +89,8 @@ class Squeezy:
         """Persist player name to XDG config directory."""
         config.save_player_name(name)
 
-    def __init__(self, name=None, server=None, mac=None, device_id=None, latency_msec=None):
+    def __init__(self, name=None, server=None, mac=None, device_id=None,
+                 latency_msec=None, buffer_size_kb=None):
         """Initialize the Squeezy player.
 
         Args:
@@ -99,6 +100,7 @@ class Squeezy:
             mac: MAC address string ("aa:bb:cc:dd:ee:ff"). If None, auto-detected.
             device_id: miniaudio device ID for audio output. If None, uses default.
             latency_msec: Override for OS audio pipeline latency (for sync tuning).
+            buffer_size_kb: PCM buffer size in KB (default: 4096, range: 64-8192).
         """
         # CLI name always wins; otherwise use saved name; otherwise default
         if name:
@@ -117,7 +119,15 @@ class Squeezy:
         self._failed_connect_count = 0  # Reconnection fallback to UDP discovery
 
         # Audio buffer (thread-safe, shared by stream/decode/miniaudio threads)
-        self.pcm_buf = PCMBuffer()
+        # --buffer-size CLI flag overrides default 4MB; clamped to 64KB-8MB range
+        if buffer_size_kb is not None:
+            clamped_kb = max(64, min(buffer_size_kb, 8192))
+            if clamped_kb != buffer_size_kb:
+                log.warning("Buffer size clamped to %dKB (requested %dKB)", clamped_kb, buffer_size_kb)
+            self.pcm_buf = PCMBuffer(max_size=clamped_kb * 1024)
+            log.info("PCM buffer: %dKB", clamped_kb)
+        else:
+            self.pcm_buf = PCMBuffer()
 
         # Message dispatch — all protocol parsing lives in handler.py
         self.protocol = protocol_handler.ProtocolHandler(self)
@@ -1513,6 +1523,24 @@ class Squeezy:
                 buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
+        except Exception as e:
+            if self.audio_device_id is not None:
+                # Device-specific failure (e.g., ALSA "device busy") — retry with system default
+                log.warning("Audio device failed (%s), retrying with system default", e)
+                try:
+                    self.device = miniaudio.PlaybackDevice(
+                        output_format=miniaudio.SampleFormat.SIGNED16,
+                        nchannels=slimproto.CHANNELS,
+                        sample_rate=self.current_sample_rate,
+                        buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
+                    )
+                except Exception as e2:
+                    log.error("Audio start failed (default device): %s", e2)
+                    return
+            else:
+                log.error("Audio start failed: %s", e)
+                return
+        try:
             log.debug("Audio device buffer: %dms (requested %dms)",
                       self.device.buffersize_msec, slimproto.DEVICE_BUFFER_MSEC)
             self.playing = True  # Set before start() — generator checks this immediately
@@ -1570,6 +1598,23 @@ class Squeezy:
                 buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
                 device_id=self.audio_device_id,
             )
+        except Exception as e:
+            if self.audio_device_id is not None:
+                log.warning("Audio device failed on resume (%s), retrying with system default", e)
+                try:
+                    self.device = miniaudio.PlaybackDevice(
+                        output_format=miniaudio.SampleFormat.SIGNED16,
+                        nchannels=slimproto.CHANNELS,
+                        sample_rate=self.current_sample_rate,
+                        buffersize_msec=slimproto.DEVICE_BUFFER_MSEC,
+                    )
+                except Exception as e2:
+                    log.error("Audio resume failed (default device): %s", e2)
+                    return
+            else:
+                log.error("Audio resume failed: %s", e)
+                return
+        try:
             gen = self._audio_generator()
             next(gen)  # prime the generator
             self.device.start(gen)
@@ -1725,6 +1770,9 @@ def main():
     parser.add_argument("--latency", type=int, default=None, metavar="MS",
                         help=f"OS audio pipeline latency in ms (default: {slimproto.PLATFORM_PIPELINE_MSEC}ms on this platform). "
                              "Increase if sync is behind, decrease if ahead.")
+    parser.add_argument("--buffer-size", type=int, default=None, metavar="KB",
+                        help="PCM buffer size in KB (default: 4096, range: 64-8192). "
+                             "Larger buffers help on slow networks, smaller reduces latency.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase verbosity (-v info, -vv debug)")
     parser.add_argument("--version", action="version", version=f"squeezy {VERSION}")
@@ -1762,7 +1810,8 @@ def main():
         log.info("Audio output: system default")
 
     player = Squeezy(name=args.name, server=args.server, mac=args.mac,
-                     device_id=device_id, latency_msec=args.latency)
+                     device_id=device_id, latency_msec=args.latency,
+                     buffer_size_kb=args.buffer_size)
 
     def handle_signal(sig, frame):
         if not player.running:

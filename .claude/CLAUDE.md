@@ -179,7 +179,7 @@ DEVICE_DELAY_MSEC = 80       # fallback static total (buffer + pipeline)
 
 ## Testing
 
-**Unit tests (76 unit + 14 integration = 90 total):**
+**Unit tests (84 unit + 14 integration = 98 total):**
 ```bash
 PYTHONPATH=src python3 -m pytest tests/                     # all unit tests
 PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 tests only
@@ -195,7 +195,7 @@ make test                                                   # shortcut (sets PYT
 **Test coverage:**
 - P1 Reliability (14 tests) — Connection, heartbeat, state management
 - P2 Features (41 tests) — Gapless, crossfade, replay gain, ICY metadata, sample rate
-- P3 Robustness (21 tests) — MP3 gapless, memory management, DSCO, graceful shutdown
+- P3 Robustness (29 tests) — MP3 gapless, memory management, buffer edge cases, DSCO, graceful shutdown
 - Integration (14 tests) — End-to-end with real LMS
 
 ---

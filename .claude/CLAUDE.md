@@ -12,45 +12,43 @@ A minimal Python reimplementation of **squeezelite** — a software player for
 
 - Implements the **SlimProto protocol** (TCP port 3483) to register as a player
 - Fetches audio via **HTTP** from LMS, decodes with **ffmpeg**, plays via **miniaudio**
-- Modular implementation: 8 focused modules (~1,730 lines) + main orchestrator (~1,990 lines)
 - Published on PyPI as `squeezy`, installable via `pip install squeezy` or `pipx install squeezy`
 
 ---
 
 ## Current version
 
-**v0.2.0** on PyPI / Homebrew. Many unreleased fixes in `main` since then
-(see "What's changed since v0.2.0" below) — next release will be v0.3.0.
+**v0.4.0** on PyPI / Homebrew.
 
 ---
 
-## Architecture / key design decisions
+## Architecture
 
-### Module structure (v0.3.0+)
-The codebase is organized into focused modules with clear layer dependencies:
+### Module structure
+```
+src/squeezy/
+├── squeezy.py                  # Main orchestrator, audio pipeline, CLI (~1,780 lines)
+├── audio/
+│   └── stream_decoder.py       # Thread-safe PCMBuffer (bounded, backpressure)
+├── protocol/
+│   ├── handler.py              # SlimProto message handlers (strm, audg, setd, etc.)
+│   ├── slimproto.py            # Protocol constants & packet builders
+│   └── lms_client.py           # SlimProto message sending (HELO, STAT, DSCO, etc.)
+├── network/
+│   ├── server_connection.py    # TCP/UDP socket management, discovery
+│   ├── lms_metadata.py         # LMS JSON-RPC track metadata queries
+│   └── status_server.py        # Unix socket status server for external tools
+└── config/
+    ├── config.py               # XDG-compliant config persistence
+    └── metadata.py             # ICY metadata & LAME gapless parsing
+```
 
-**Layer 0 (Foundation — no dependencies):**
-- `protocol/slimproto.py` (~400 lines) — Protocol constants, packet builders, utility functions
-- `config/config.py` (69 lines) — XDG config directory management (player name persistence)
-- `config/metadata.py` (~180 lines) — ICY/Shoutcast metadata parsing, LAME gapless info
-
-**Layer 1 (Protocol & Network — foundation only):**
-- `network/server_connection.py` (~150 lines) — TCP/UDP socket management, discovery
-- `network/lms_metadata.py` (83 lines) — LMS JSON-RPC track metadata queries
-- `network/status_server.py` (126 lines) — Unix socket status server for external tools
-- `protocol/lms_client.py` (122 lines) — SlimProto message sending (HELO, STAT, DSCO, etc.)
-
-**Layer 2 (Audio buffer):**
-- `audio/stream_decoder.py` (~140 lines) — Thread-safe PCMBuffer (bounded, backpressure)
-
-**Layer 3 (Message handlers — calls back into squeezy.py for state transitions):**
-- `protocol/handler.py` (~420 lines) — All SlimProto message parsing & dispatch (strm, audg, setd, cont, serv, dsco, aude)
-
-**Main orchestration:**
-- `squeezy.py` (~1,780 lines) — Audio pipeline, streaming, CLI, main loop, state management
-
-Protocol message handling is delegated to `handler.py`. Audio device management,
-streaming, and the audio generator remain in `squeezy.py`.
+**Layer dependencies (no upward imports):**
+- **Layer 0** — `protocol/slimproto.py`, `config/config.py`, `config/metadata.py`
+- **Layer 1** — `network/`, `protocol/lms_client.py` (foundation only)
+- **Layer 2** — `audio/stream_decoder.py`
+- **Layer 3** — `protocol/handler.py` (calls back into squeezy.py for state transitions)
+- **Main** — `squeezy.py` (orchestrates all modules)
 
 ### Threading model
 ```
@@ -85,7 +83,7 @@ at time T → real audio starts   →  send STMs
 
 ---
 
-## Critical bugs fixed in this codebase (don't regress these)
+## Critical bugs fixed (don't regress these)
 
 ### STAT packet field ordering (ROOT CAUSE of "time=30" bug)
 Format string is `">4sBBBIIIIHIIIIHIIH"`.
@@ -114,55 +112,14 @@ from all synced players before sending `strm u` with the shared start time.
 Without STMl, both players hang indefinitely.
 
 ### SlimProto message offset calculation (CRITICAL for packet parsing)
-When parsing SlimProto messages, `payload = msg[4:]` removes the 4-byte opcode.
-**All offsets used in payload parsing are relative to this stripped message, NOT the original message.**
-Example: If a field is at `msg[18]` (absolute message offset), it's at `payload[14]` in the code.
-Calculation: `payload_offset = msg_offset - 4`
-This mismatch caused 10 test failures during refactoring (replay_gain, transition parameters).
-Always verify offset calculations when modifying protocol parsing or tests.
+`handler.py` uses message-relative offsets (e.g., `msg[18]`), not
+payload-relative. All offsets are documented in the `_handle_strm_start`
+docstring. When modifying protocol parsing, always verify against those
+comments — a mismatch caused 10 test failures during a past refactor.
 
 ---
 
-## What's changed since v0.2.0 (unreleased, in `main`)
-
-Core features from v0.2.0+v0.3.0:
-- Volume control from LMS remote (`_handle_audg`, s16le scaling)
-- Log levels: `-v` = INFO, `-vv` = DEBUG, default = WARNING
-- Version single-sourced from `pyproject.toml` via `importlib.metadata`
-- Auto-update check on startup (non-blocking, silent on failure)
-- Install method detection for upgrade instructions (brew/pipx/pip)
-- Multi-OS CI (Ubuntu × macOS × Windows, Python 3.10/3.12/3.14)
-- Dockerfile + linux distro test script
-- Track queuing for gapless transition (STMd sent late, pending_track queue)
-- Sync group support: STMl, `strm u` with jiffies, start-at-time silence
-- miniaudio buffer reduced 200ms → 40ms (`DEVICE_BUFFER_MSEC`)
-- Dynamic device delay compensation in `_elapsed_ms()` (wall-clock based)
-- Platform pipeline latency constant + `--latency` CLI flag
-- Extensive comments and named struct format constants
-
-**Priority 2 User-Facing Quality (9/11 complete):**
-- P2.1 True gapless playback — device persistence, track boundary tracking, zero-gap transitions
-- P2.2 Crossfade Support — 5 fade modes with complementary gain curves, sample-by-sample mixing
-- P2.3 Replay gain — 16.16 fixed-point extraction, multiplicative with volume control
-- P2.4 ICY metadata — Shoutcast radio metadata parsing and status reporting
-- P2.5 Variable sample rate — 44.1k/48k/96k/192k native support, ffmpeg detection, device switching
-- P2.7 HTTPS/SSL Stream Support — port 443 detection, SSL wrapping, CanHTTPS capability
-- P2.9 Player Name Persistence — save/load to ~/.config/squeezy/ with XDG support
-- P2.10 CONT Metaint Support — extract metaint for ICY metadata synchronization
-- P2.11 Codec Priority — ffmpeg decoder probing, dynamic codec reporting to LMS
-
-**Priority 3 Robustness (7/13 complete):**
-- P3.6 MP3 Gapless — LAME encoder delay/padding parsing
-- P3.7 Memory Management — PCMBuffer max size (4MB default, OOM prevention)
-- P3.9 Thread Safety — Audited all shared state, documented invariants
-- P3.10 Graceful Shutdown — Signal handling, clean teardown
-- P3.11 DSCO Packet — Server-initiated disconnect/reconnect
-- P3.12 SERV Packet — Server redirect
-- P3.13 AUDE Packet — Audio enable/disable
-
----
-
-## Key constants (defined in `protocol/slimproto.py`, re-exported in `squeezy.py`)
+## Key constants (`protocol/slimproto.py`)
 
 ```python
 SAMPLE_RATE = 44100
@@ -171,66 +128,40 @@ BYTES_PER_FRAME = 4          # s16le stereo: 2 bytes × 2 channels
 DEVICE_BUFFER_MSEC = 40      # miniaudio buffer size
 PLATFORM_PIPELINE_MSEC = 40  # macOS CoreAudio extra latency (10 on Linux, 30 on Windows)
 DEVICE_DELAY_MSEC = 80       # fallback static total (buffer + pipeline)
+PCM_BUF_MAX_SIZE = 4MB       # PCMBuffer default max (~23s at 44.1k stereo)
 ```
 
-`--latency N` CLI flag overrides `PLATFORM_PIPELINE_MSEC` at runtime.
+`--latency N` overrides `PLATFORM_PIPELINE_MSEC` at runtime.
+`--buffer-size KB` overrides `PCM_BUF_MAX_SIZE` at runtime (64-8192 KB).
 
 ---
 
 ## Testing
 
-**Unit tests (84 unit + 14 integration = 98 total):**
+**84 unit tests + 14 integration = 98 total:**
 ```bash
-PYTHONPATH=src python3 -m pytest tests/                     # all unit tests
-PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 tests only
-PYTHONPATH=src python3 -m pytest tests/test_p2_features.py     # P2 tests only
-PYTHONPATH=src python3 -m pytest tests/test_p2_features.py::TestP23ReplayGain -xvs  # specific class
-make test                                                   # shortcut (sets PYTHONPATH)
+PYTHONPATH=src python3 -m pytest tests/                        # all unit tests
+PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 only
+PYTHONPATH=src python3 -m pytest tests/test_p2_features.py     # P2 only
+PYTHONPATH=src python3 -m pytest tests/test_p3_robustness.py   # P3 only
+make test                                                       # shortcut
 ```
 
-**Important:**
-- `PYTHONPATH=src` is required (or `pip3 install .` to install the package)
-- Integration tests (`test_integration.py`) require running LMS server + ffmpeg; skip for unit-only runs
+- `PYTHONPATH=src` is required (or `pip install -e .`)
+- Integration tests require a running LMS server + ffmpeg
 
-**Test coverage:**
-- P1 Reliability (14 tests) — Connection, heartbeat, state management
-- P2 Features (41 tests) — Gapless, crossfade, replay gain, ICY metadata, sample rate
-- P3 Robustness (29 tests) — MP3 gapless, memory management, buffer edge cases, DSCO, graceful shutdown
-- Integration (14 tests) — End-to-end with real LMS
-
----
-
-## Known issues / active debugging
-
-### Linux distro tests
-Debian 11 bullseye still fails apt install (pipx not in repos). Fix:
-install `python3-pip` separately and skip pipx.
-
-### Sync offset
-~40-45ms LMS player offset still needed on macOS even with `--latency 40`.
-The dynamic wall-clock measurement correctly tracks the miniaudio buffer,
-but the CoreAudio pipeline depth below miniaudio is hard to query precisely.
-`--latency` is the user-facing knob for this.
-
----
-
-## TODO / backlog
-
-Full list in `TODO.md` — 40+ items prioritised P1-P5.
-
-**Status:**
-- P1 (8/8) Critical Reliability — All complete
-- P2 (9/11) User-Facing Quality — 9 of 11 complete
-  - P2.6 (24-bit audio) — deferred
-  - P2.8 (Hardware volume) — skipped (platform-specific)
-- P3 (7/13) Robustness & Edge Cases — In progress
+**Coverage:**
+- P1 Reliability (14 tests) — connection, heartbeat, state management
+- P2 Features (41 tests) — gapless, crossfade, replay gain, ICY metadata, sample rate
+- P3 Robustness (29 tests) — MP3 gapless, PCMBuffer edge cases, DSCO, graceful shutdown
+- Integration (14 tests) — end-to-end with real LMS
 
 ---
 
 ## How to run locally
 
 ```bash
-# Quick dev run (no install needed, picks up code changes immediately):
+# No install needed — picks up code changes immediately:
 ./run.sh -n "Squeezy" -vv          # debug logging
 ./run.sh -n "Squeezy" -v           # info logging
 ./run.sh -n "Squeezy" --latency 45 # tune sync offset
@@ -242,21 +173,21 @@ PYTHONPATH=src python3 -m squeezy -n "Squeezy" -vv
 
 ---
 
-## How to release (v0.3.0)
+## How to release
 
 ```bash
 # 1. Bump version in pyproject.toml
-# 2. Commit + tag
-git commit -am "chore: release v0.3.0"
-git tag v0.3.0 && git push && git push --tags
+# 2. Commit, tag, push
+git commit -am "chore: release vX.Y.Z"
+git tag vX.Y.Z && git push && git push --tags
 
-# 3. Build + upload to PyPI
+# 3. Build and upload to PyPI
 rm -rf dist/ build/
-python -m build
-twine upload dist/*
+pipx run build
+pipx run twine upload dist/*
 
 # 4. Update Homebrew tap
-curl -sL https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/archive/refs/tags/v0.3.0.tar.gz | shasum -a 256
+curl -sL https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
 # Update url + sha256 in homebrew-tap/Formula/squeezy.rb, commit, push
 ```
 
@@ -283,3 +214,12 @@ When squeezy behaviour needs to match squeezelite, check the
 | PCM/WAV header parsing | `pcm.c` | 77-181 |
 
 Protocol spec: https://wiki.slimdevices.com/index.php/SlimProto_TCP_protocol
+
+---
+
+## Known issues
+
+### Sync offset on macOS
+~40-45ms LMS player offset still needed even with `--latency 40`. The dynamic
+wall-clock measurement correctly tracks the miniaudio buffer, but CoreAudio
+pipeline depth below miniaudio is hard to query precisely. Use `--latency` to tune.

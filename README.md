@@ -2,6 +2,20 @@
 
 Minimal Squeezebox-compatible player for [Lyrion Music Server](https://lyrion.org/) (formerly Logitech Media Server). Advertises as a player on your network, receives streaming audio, and plays it back through your default audio output. Supports synchronized playback with other players.
 
+## Before you use this
+
+**If you can run a binary, use [LocalPlayer](https://github.com/LMS-Community/plugin-LocalPlayer) instead.** It's a Lyrion Music Server plugin that bundles [squeezelite](https://github.com/ralph-irving/squeezelite) — a proper, mature, battle-tested C implementation. It installs in two clicks from the LMS plugin browser, handles every edge case, and just works. Nearly every protocol detail and edge case in squeezy was reverse-engineered from squeezelite's source. It is the gold standard and the direct inspiration for this project.
+
+**Squeezy exists for one narrow situation:** you're on a machine where you can't run an unverified or unpackaged binary — a locked-down work laptop, a corporate machine with strict security policy, a CI environment — but you *can* run Python packages. That's how this project started: wanting to listen to music on a work laptop through Lyrion without having to file an IT ticket to run a compiled binary from the internet. `pip install squeezy` and it just works.
+
+If that's not your situation, seriously — go use LocalPlayer. It's better in every way.
+
+---
+
+> **Note:** This project was largely vibe-coded with [Claude](https://claude.ai). It passes ~100 tests and works reliably day-to-day, but treat it accordingly.
+
+---
+
 ## Requirements
 
 - macOS, Linux, or Windows

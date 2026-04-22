@@ -8,6 +8,8 @@ on:
 jobs:
   update-tap:
     runs-on: macos-latest
+    permissions:
+      contents: write   # needed to create GitHub Releases
     steps:
       - name: Checkout squeezy (for pyproject.toml version)
         uses: actions/checkout@v4

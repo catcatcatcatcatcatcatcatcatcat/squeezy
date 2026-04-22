@@ -53,8 +53,23 @@ class ServerConnection:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(slimproto.DISCOVERY_TIMEOUT_SEC)
 
-        # Build list of broadcast addresses to try
-        broadcast_addrs = ["255.255.255.255"]
+        # Build list of broadcast addresses to try.
+        # Start with the subnet-specific broadcast for our outbound interface,
+        # which we detect by connecting a UDP socket (no packets sent).
+        # This works on any subnet (10.x, 192.168.x, etc.) without netifaces.
+        broadcast_addrs = []
+        try:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.connect(("255.255.255.255", 1))
+            local_ip = _s.getsockname()[0]
+            _s.close()
+            # Assume /24 — covers virtually all home/office LANs
+            subnet_bcast = local_ip.rsplit(".", 1)[0] + ".255"
+            broadcast_addrs.append(subnet_bcast)
+            log.debug("Local IP %s → trying subnet broadcast %s", local_ip, subnet_bcast)
+        except OSError:
+            pass
+        broadcast_addrs.append("255.255.255.255")
         try:
             import netifaces
             for iface in netifaces.interfaces():
@@ -63,9 +78,7 @@ class ServerConnection:
                     if "broadcast" in addr:
                         broadcast_addrs.append(addr["broadcast"])
         except ImportError:
-            # netifaces not installed — try common subnet broadcasts
-            broadcast_addrs.extend(["192.168.1.255", "192.168.0.255",
-                                    "10.0.0.255", "172.16.0.255"])
+            pass  # subnet broadcast above already covers the common case
 
         for attempt in range(slimproto.DISCOVERY_ATTEMPTS):
             for bcast in broadcast_addrs:

@@ -466,8 +466,10 @@ class Squeezy:
             True if connected and HELO sent, False on failure.
         """
         if not self.server_ip:
+            print("Discovering server...", flush=True)
             self.server_ip = self.discover()
             if not self.server_ip:
+                print("No server found.", flush=True)
                 log.error("No server found")
                 return False
 
@@ -485,8 +487,11 @@ class Squeezy:
         helo = slimproto.build_helo(self.mac, self._capabilities(), reconnect=self.reconnect,
                           bytes_received=self.stream_bytes)
         self._send(helo)
+        first_connect = not self.reconnect
         self.reconnect = True
         log.info("Connected, HELO sent (MAC: %s)", ":".join(f"{b:02x}" for b in self.mac))
+        if first_connect:
+            print(f"Connected to {self.server_ip}. Ready.", flush=True)
         return True
 
     # --- Message loop ---

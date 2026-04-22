@@ -7,25 +7,29 @@ on:
 
 jobs:
   update-tap:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
+      - name: Checkout squeezy (for pyproject.toml version)
+        uses: actions/checkout@v4
+
       - name: Compute tarball sha256
         id: tarball
         run: |
           TAG="${{ github.ref_name }}"
           URL="https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/archive/refs/tags/${TAG}.tar.gz"
-          SHA=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
-          echo "tag=$TAG"   >> $GITHUB_OUTPUT
-          echo "url=$URL"   >> $GITHUB_OUTPUT
-          echo "sha=$SHA"   >> $GITHUB_OUTPUT
+          SHA=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
 
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
           repository: catcatcatcatcatcatcatcatcatcat/homebrew-tap
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
 
-      - name: Update formula
+      - name: Update source url and sha256
         env:
           TAG: ${{ steps.tarball.outputs.tag }}
           URL: ${{ steps.tarball.outputs.url }}
@@ -34,11 +38,10 @@ jobs:
           python3 - <<'EOF'
           import re, os
 
-          tag = os.environ['TAG']
-          url  = os.environ['URL']
-          sha  = os.environ['SHA']
+          url = os.environ['URL']
+          sha = os.environ['SHA']
 
-          with open('Formula/squeezy.rb') as f:
+          with open('homebrew-tap/Formula/squeezy.rb') as f:
               content = f.read()
 
           # Update first url line only (not the resource urls below it)
@@ -55,15 +58,34 @@ jobs:
               content, count=1
           )
 
-          with open('Formula/squeezy.rb', 'w') as f:
+          with open('homebrew-tap/Formula/squeezy.rb', 'w') as f:
               f.write(content)
 
-          print(f"Updated to {tag}")
-          print(f"  url:    {url}")
-          print(f"  sha256: {sha}")
+          print(f"url:    {url}")
+          print(f"sha256: {sha}")
           EOF
 
-      - name: Commit and push
+      - name: Refresh Python dependency resources
+        run: |
+          # brew update-python-resources re-resolves all resource blocks to latest
+          # compatible versions with correct sha256s — no manual pinning needed.
+          brew update-python-resources homebrew-tap/Formula/squeezy.rb
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Extract version number (strip leading 'v')
+          VERSION="${TAG#v}"
+          gh release create "$TAG" \
+            --repo catcatcatcatcatcatcatcatcatcat/squeezy \
+            --title "squeezy $TAG" \
+            --notes "See [CHANGELOG](https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/commits/$TAG) for what changed in this release." \
+            --verify-tag
+
+      - name: Commit and push tap update
+        working-directory: homebrew-tap
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

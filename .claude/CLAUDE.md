@@ -176,20 +176,18 @@ PYTHONPATH=src python3 -m squeezy -n "Squeezy" -vv
 ## How to release
 
 ```bash
-# 1. Bump version in pyproject.toml
-# 2. Commit, tag, push
-git commit -am "chore: release vX.Y.Z"
-git tag vX.Y.Z && git push && git push --tags
-
-# 3. Build and upload to PyPI
-rm -rf dist/ build/
-pipx run build
-pipx run twine upload dist/*
-
-# 4. Update Homebrew tap
-curl -sL https://github.com/catcatcatcatcatcatcatcatcatcat/squeezy/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-# Update url + sha256 in homebrew-tap/Formula/squeezy.rb, commit, push
+make release-patch   # 0.4.0 → 0.4.1  bug fixes
+make release-minor   # 0.4.0 → 0.5.0  new features
+make release-major   # 0.4.0 → 1.0.0  breaking changes
 ```
+
+`release.sh` bumps `pyproject.toml`, commits, tags, pushes, then builds and
+uploads to PyPI. The tag push fires the CI workflow which auto-updates the
+Homebrew tap (sha256 + dependency pins) and creates a GitHub Release.
+
+**Never rewrite or force-push a tag that has already been released to Homebrew.**
+Doing so changes the tarball sha256 and breaks `brew upgrade` until the tap is
+manually patched.
 
 ---
 

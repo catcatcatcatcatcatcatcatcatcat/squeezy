@@ -335,9 +335,24 @@ make test
 
 ## How to release a new version
 
-1. Update `version` in `pyproject.toml`
-2. Commit: `git commit -am "chore: bump version to X.Y.Z"`
-3. Tag: `git tag vX.Y.Z && git push && git push --tags`
-4. Build: `rm -rf dist/ build/ && python -m build`
-5. Upload: `twine upload dist/*`
-6. Update Homebrew tap formula with new version + SHA256
+```bash
+make release-patch   # 0.4.0 → 0.4.1  (bug fixes)
+make release-minor   # 0.4.0 → 0.5.0  (new features)
+make release-major   # 0.4.0 → 1.0.0  (breaking changes)
+```
+
+This runs `release.sh`, which:
+
+1. Reads the current version from `pyproject.toml`
+2. Asks for confirmation before doing anything
+3. Bumps `version` in `pyproject.toml` and commits
+4. Creates the version tag and pushes commit + tag
+5. Builds and uploads to PyPI via `pipx run build` + `pipx run twine`
+
+The push of the tag fires a GitHub Actions workflow (`.github/workflows/update-homebrew-tap.yml`) that:
+- Recomputes the tarball sha256
+- Runs `brew update-python-resources` to refresh dependency pins
+- Commits the updated formula to `homebrew-tap`
+- Creates a GitHub Release
+
+**Requirements:** `pipx` must be on your PATH with `build` and `twine` available (`pipx install twine`). PyPI credentials must be configured (either `~/.pypirc` or a `PYPI_API_TOKEN` env var).

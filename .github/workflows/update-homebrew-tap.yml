@@ -67,9 +67,11 @@ jobs:
 
       - name: Refresh Python dependency resources
         run: |
-          # brew update-python-resources re-resolves all resource blocks to latest
-          # compatible versions with correct sha256s — no manual pinning needed.
-          brew update-python-resources homebrew-tap/Formula/squeezy.rb
+          # brew update-python-resources needs the formula referenced by tap name,
+          # not a file path. Temporarily tap the local checkout so brew can find it.
+          brew tap catcatcatcatcatcatcatcatcatcat/tap "$(pwd)/homebrew-tap"
+          brew update-python-resources catcatcatcatcatcatcatcatcatcat/tap/squeezy
+          # Changes are written back into homebrew-tap/Formula/squeezy.rb in-place.
 
       - name: Create GitHub Release
         env:

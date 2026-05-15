@@ -91,8 +91,13 @@ class ProtocolHandler:
         if command == "t":
             # Timing request — echo server timestamp back to LMS.
             # LMS uses the round-trip time to estimate network delay for sync.
+            # The ts value is LMS's current jiffies; we echo it in STAT so
+            # LMS can compute round-trip latency and adjust sync accordingly.
             if len(msg) >= 22:
                 ts = struct.unpack_from(">I", msg, 18)[0]
+                elapsed = self.squeezy._elapsed_ms()
+                log.debug("strm t: server_ts=%d our_elapsed=%dms (sync timing ping)",
+                          ts, elapsed)
                 self.squeezy._send_stat("STMt", server_timestamp=ts)
             else:
                 self.squeezy._send_stat("STMt")
@@ -128,19 +133,40 @@ class ProtocolHandler:
             if len(msg) >= 22:
                 target_jiffies = struct.unpack_from(">I", msg, 18)[0]
 
+            now_jiffies = slimproto.gettime_ms()
             self.squeezy.start_at_jiffies = target_jiffies
-            log.debug("unpause at: %d now: %d", target_jiffies, slimproto.gettime_ms())
+
             if self.squeezy.paused:
+                # Normal unpause after strm-p
+                log.debug("strm u: unpause (was paused), target_jiffies=%d now=%d",
+                          target_jiffies, now_jiffies)
                 self.squeezy.paused = False
                 self.squeezy._resume_audio()
-            elif not self.squeezy.playing and self.squeezy.pcm_buf.available() > 0:
-                # Not yet playing (e.g., sync mode: we sent STMl but LMS
-                # hadn't told us to start yet). Start audio now — the
-                # generator will output silence until start_at_jiffies.
-                if target_jiffies:
-                    self.squeezy._start_audio_at_time()
-                else:
-                    self.squeezy._start_audio()
+            elif self.squeezy.playing:
+                # LMS-initiated re-sync during active playback.
+                # This is LMS correcting accumulated sync drift — it detected
+                # we were out of step with other players and is giving us a new
+                # start-at-time anchor.  The audio generator will output silence
+                # until target_jiffies, then reset output_frames to 0 and send STMs.
+                elapsed_now = self.squeezy._elapsed_ms()
+                lead_ms = (target_jiffies - now_jiffies) & 0xFFFFFFFF
+                if lead_ms > slimproto.JIFFIES_WRAP_GUARD:
+                    lead_ms = 0  # wrapped; treat as immediate
+                log.info(
+                    "SYNC re-sync from LMS: target_jiffies=%d now=%d "
+                    "lead=%dms our_elapsed=%dms",
+                    target_jiffies, now_jiffies, lead_ms, elapsed_now,
+                )
+            else:
+                # Not yet playing (sync mode: we sent STMl, LMS now says start).
+                log.debug("strm u: sync start, target_jiffies=%d now=%d lead=%dms",
+                          target_jiffies, now_jiffies,
+                          (target_jiffies - now_jiffies) & 0xFFFFFFFF)
+                if self.squeezy.pcm_buf.available() > 0:
+                    if target_jiffies:
+                        self.squeezy._start_audio_at_time()
+                    else:
+                        self.squeezy._start_audio()
             self.squeezy._send_stat("STMr")
 
         elif command == "a":

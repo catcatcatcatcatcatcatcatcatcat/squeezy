@@ -175,6 +175,15 @@ class Squeezy:
         self._device_start_time = None   # monotonic time of first real audio frame
         self._device_start_frames = 0    # output_frames value at that moment
 
+        # Wall-clock bridge for elapsed time — mirrors squeezelite's
+        # `ms_played += (now - status.updated)` in slimproto.c:165.
+        # `output_frames` is only incremented when real (non-silence) audio is
+        # yielded, so during buffer underruns or silence padding it stalls.
+        # The bridge adds wall-clock time since the last frame update so that
+        # elapsed_ms keeps advancing in lockstep with what the device is
+        # actually playing out.
+        self._last_frame_update_time = None  # time.monotonic() of last output_frames bump
+
         # STAT flags (match squeezelite: only send each once per track)
         self.sent_STMd = False
         self.sent_STMu = False
@@ -229,6 +238,13 @@ class Squeezy:
 
         # Server timeout detection (35-second heartbeat)
         self._last_server_msg = time.monotonic()
+
+        # Sync drift detection — compare wall-clock delta vs elapsed-time delta
+        # between consecutive STMt heartbeats.  Logged at debug level every ~10s.
+        self._last_statt_wall = None    # time.monotonic() at last STMt send
+        self._last_statt_elapsed = None # elapsed_ms reported in last STMt
+        self._sync_drift_accum = 0.0   # running total drift (ms) since track start
+        self._statt_count = 0           # heartbeats sent this track (for periodic log)
 
         self._send_lock = threading.Lock()
 
@@ -400,7 +416,57 @@ class Squeezy:
         - Elapsed time (how far into the current track we are)
         - Server timestamp echo (for round-trip timing / sync)
         """
+        now_wall = time.monotonic()
         elapsed = self._elapsed_ms()
+
+        # Sync drift accounting — every STMt while playing:
+        # Between consecutive heartbeats, wall-clock delta should equal elapsed delta.
+        # Any discrepancy is drift in our elapsed reporting.  Accumulated over time,
+        # this is what LMS sees and tries to correct via sync adjustments.
+        if event == "STMt" and self.playing:
+            if self._last_statt_wall is not None:
+                wall_delta_ms = (now_wall - self._last_statt_wall) * 1000.0
+                elapsed_delta_ms = elapsed - self._last_statt_elapsed
+                # Positive = we reported MORE time than passed (LMS thinks we're ahead)
+                # Negative = we reported LESS time than passed (LMS thinks we're behind)
+                tick_drift = elapsed_delta_ms - wall_delta_ms
+                self._sync_drift_accum += tick_drift
+                self._statt_count += 1
+                # Log every ~10 heartbeats (≈10 seconds) or when drift exceeds 20ms.
+                # Fields explained:
+                #   elapsed        — what we told LMS (ms since track start, delay-compensated)
+                #   wall_Δ/elapsed_Δ — how much real time / reported time passed this tick
+                #   tick_drift     — per-tick discrepancy; consistent sign → systematic error
+                #   accum_drift    — total drift since track start; this is what LMS sees
+                #   rate           — sample rate; mismatch (44.1k vs 48k) = 8% drift
+                #   buf_avail      — PCM buffer bytes; near-zero means silence → frames stall
+                #   device_buf     — actual miniaudio buffer (ms); drives delay compensation
+                #   delay_comp     — total delay subtracted from elapsed (device_buf + pipeline)
+                if self._statt_count % 10 == 0 or abs(tick_drift) > 20:
+                    frames_in_track = self.output_frames - self._track_start_frames
+                    device_buf_ms = (self.device.buffersize_msec
+                                     if self.device else slimproto.DEVICE_BUFFER_MSEC)
+                    delay_ms = device_buf_ms + self.pipeline_latency_msec
+                    # bridge_ms: how much wall-clock the elapsed report bridges
+                    # past the last frame update.  >50ms means the buffer was
+                    # silent (underrun / silence-pad) for that long and the
+                    # bridge is keeping elapsed honest.
+                    if self._last_frame_update_time is not None:
+                        bridge_ms = (now_wall - self._last_frame_update_time) * 1000.0
+                    else:
+                        bridge_ms = 0.0
+                    log.debug(
+                        "SYNC elapsed=%dms wall_Δ=%.1fms elapsed_Δ=%.1fms "
+                        "tick_drift=%.1fms accum_drift=%.1fms bridge=%.1fms "
+                        "rate=%d buf_avail=%d device_buf=%dms delay_comp=%dms",
+                        elapsed, wall_delta_ms, elapsed_delta_ms,
+                        tick_drift, self._sync_drift_accum, bridge_ms,
+                        self.current_sample_rate, self.pcm_buf.available(),
+                        device_buf_ms, delay_ms,
+                    )
+            self._last_statt_wall = now_wall
+            self._last_statt_elapsed = elapsed
+
         # Suppress repetitive STMt logging when idle
         if event != "STMt" or self.playing:
             title = self.lms_title or self.icy_title or "Unknown"
@@ -428,19 +494,31 @@ class Squeezy:
         return f"{minutes}:{seconds:02d}"
 
     def _elapsed_ms(self):
-        """Frame-based elapsed time with static device delay compensation.
+        """Frame-based elapsed time with static device delay compensation
+        and a wall-clock bridge across silence/underrun gaps.
 
         Like squeezelite's approach (slimproto.c:163-166): subtract the
         device buffer depth from frames_played so LMS knows what the user
-        *hears*, not what we've fed to the audio device.
+        *hears*, not what we've fed to the audio device.  Then add the
+        wall-clock delta since output_frames was last updated — this is
+        squeezelite's `ms_played += (now - status.updated)` line.
 
-        We use a fixed delay estimate (DEVICE_BUFFER_MSEC + pipeline_latency_msec)
-        rather than a dynamic wall-clock measurement, because the dynamic
-        approach introduces jitter of 10-50ms per heartbeat. That jitter
-        triggers LMS's sync adjustment logic, causing audible skips in
-        synchronized playback. A fixed offset is more stable — squeezelite
-        gets stable values from snd_pcm_delay(), but miniaudio doesn't
-        expose hardware buffer depth, so a fixed estimate is our best option.
+        Why the wall-clock bridge matters: `output_frames` is only
+        incremented when *real* (non-silence) PCM data is yielded from the
+        buffer.  During buffer underruns or silence-pad tails we yield
+        silence to keep the audio device fed, but `output_frames` does
+        not advance — yet the device IS playing those frames, so elapsed
+        time SHOULD advance.  Without the bridge, every underrun and
+        every short read shaves milliseconds off our elapsed report,
+        accumulating drift over a track.  squeezelite has the same rule
+        (output.c:280-283 skips frames_played++ on silence), and the
+        bridge is what stops it drifting.
+
+        We still use a fixed delay estimate (DEVICE_BUFFER_MSEC +
+        pipeline_latency_msec) for the device-buffer correction rather
+        than a dynamic measurement.  Dynamic introduces jitter of
+        10-50ms per heartbeat that triggers LMS's sync adjustment and
+        causes audible skips.
 
         For gapless: elapsed time is relative to current track boundary
         (output_frames since current track started).
@@ -454,7 +532,19 @@ class Squeezy:
         device_delay_frames = self.current_sample_rate * (slimproto.DEVICE_BUFFER_MSEC + self.pipeline_latency_msec) // 1000
 
         frames = max(0, frames_in_track - device_delay_frames)
-        return int(frames * 1000 / self.current_sample_rate)
+        ms = int(frames * 1000 / self.current_sample_rate)
+
+        # Wall-clock bridge: add ms since output_frames was last updated.
+        # In steady state this is ~one audio callback (≤40ms); during a
+        # silence/underrun it grows to span the gap.  Cap at 1000ms as a
+        # safety bound — if frames haven't advanced in over a second
+        # we're not really playing and shouldn't fabricate elapsed time.
+        if self._last_frame_update_time is not None:
+            bridge_ms = (time.monotonic() - self._last_frame_update_time) * 1000.0
+            if 0 < bridge_ms < 1000:
+                ms += int(bridge_ms)
+
+        return ms
 
     def connect(self):
         """Connect to LMS via TCP and send the HELO registration packet.
@@ -679,10 +769,17 @@ class Squeezy:
         self.sent_STMo = False
         self.sent_STMl = False
 
+        # Reset sync drift tracking for new track
+        self._last_statt_wall = None
+        self._last_statt_elapsed = None
+        self._sync_drift_accum = 0.0
+        self._statt_count = 0
+
         # Reset progress tracking for new track
         self.output_frames = 0
         self._device_start_time = None
         self._device_start_frames = 0
+        self._last_frame_update_time = None  # bridge anchor — fresh per track
         # For true gapless playback, increment track boundary
         self._current_track_id += 1
         self._track_start_frames = 0
@@ -1338,6 +1435,11 @@ class Squeezy:
         self._crossfade_samples.clear()
         self._crossfade_pos = 0
         self._crossfade_total = 0
+        # Reset sync drift tracking for the new track
+        self._last_statt_wall = None
+        self._last_statt_elapsed = None
+        self._sync_drift_accum = 0.0
+        self._statt_count = 0
         log.debug("Track boundary: switching to track #%d at frame %d",
                   self._current_track_id, self._track_start_frames)
 
@@ -1385,13 +1487,24 @@ class Squeezy:
                         and diff < slimproto.SYNC_START_WINDOW_MS):
                     required_frames = yield b"\x00" * required_bytes
                     continue
-                # Target reached or passed — clear and start real audio
-                log.debug("Sync target reached (target=%d now=%d) — starting audio",
-                          self.start_at_jiffies, now)
+                # Target reached or passed — clear and start real audio.
+                # overshoot_ms: how many ms after the target we actually started.
+                # Positive = late start (audio begins after the sync point) — slight
+                # lead vs other players.  Should be 0-40ms (one audio callback tick).
+                # Very large value means jiffies calculation is wrong.
+                overshoot_ms = (now - self.start_at_jiffies) & 0xFFFFFFFF
+                if overshoot_ms > slimproto.JIFFIES_WRAP_GUARD:
+                    # Wrapped — we're actually before the target (shouldn't happen)
+                    overshoot_ms = 0
+                log.debug(
+                    "SYNC start: target_jiffies=%d now=%d overshoot=%dms — audio begins",
+                    self.start_at_jiffies, now, overshoot_ms,
+                )
                 self.start_at_jiffies = 0
                 # Reset output_frames so elapsed time starts from zero at the
                 # moment real audio begins — the silence frames don't count.
                 self.output_frames = 0
+                self._last_frame_update_time = None  # bridge resets with frame counter
                 self._send_stat("STMs")  # Tell LMS track started
 
             avail = self.pcm_buf.available()
@@ -1405,6 +1518,10 @@ class Squeezy:
                         self._device_start_time = time.monotonic()
                         self._device_start_frames = self.output_frames
                     self.output_frames += len(chunk) // slimproto.BYTES_PER_FRAME
+                    # Anchor for the wall-clock bridge in _elapsed_ms().  Set
+                    # AFTER the increment so any concurrent read sees a fresh
+                    # frame count paired with a fresh timestamp.
+                    self._last_frame_update_time = time.monotonic()
                     # Crossfade tail accumulation: while the old track is draining
                     # (decode done, next track queued), save the last N seconds of
                     # audio. This becomes the "old side" of the crossfade mix when
@@ -1553,6 +1670,7 @@ class Squeezy:
             self.output_frames = 0
             self._device_start_time = None   # Reset dynamic delay tracking
             self._device_start_frames = 0
+            self._last_frame_update_time = None  # bridge anchor — fresh per device start
             gen = self._audio_generator()
             next(gen)  # prime the generator before miniaudio calls send()
             self.device.start(gen)
@@ -1595,6 +1713,7 @@ class Squeezy:
         # negative (clamped to 0) and device_delay_frames too small.
         self._device_start_time = None
         self._device_start_frames = self.output_frames
+        self._last_frame_update_time = None  # bridge anchor is stale post-pause
         try:
             self.device = miniaudio.PlaybackDevice(
                 output_format=miniaudio.SampleFormat.SIGNED16,
@@ -1648,6 +1767,7 @@ class Squeezy:
         self._pending_track = None
         self._device_start_time = None
         self._device_start_frames = 0
+        self._last_frame_update_time = None  # bridge anchor — fresh on stop
 
         # Unblock writers FIRST — the decode thread may be blocked on
         # pcm_buf.write() with the buffer full and no reader consuming.

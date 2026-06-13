@@ -42,6 +42,7 @@ pipx install squeezy
 
 ```bash
 brew tap catcatcatcatcatcatcatcatcatcat/tap
+brew trust catcatcatcatcatcatcatcatcatcat/tap
 brew install squeezy
 ```
 

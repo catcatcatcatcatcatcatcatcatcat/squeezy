@@ -574,12 +574,35 @@ class Squeezy:
 
         self.sock.settimeout(slimproto.RECV_TIMEOUT_SEC)
 
-        helo = slimproto.build_helo(self.mac, self._capabilities(), reconnect=self.reconnect,
+        # Determine reconnect flag for HELO.
+        #
+        # reconnect=True tells LMS "I'm the same player, please resume my state"
+        # (sync group membership, current track position, etc.) rather than
+        # treating me as a fresh new client and restarting all synced players.
+        #
+        # self.reconnect tracks within-process reconnects (False → True after
+        # first successful connect).  Additionally, we persist the last server IP
+        # so that if the user Ctrl+C's and restarts within RECONNECT_WINDOW_SEC,
+        # the new process also sends reconnect=True — exactly what squeezelite
+        # does across its own internal reconnect loop.
+        first_connect = not self.reconnect  # True only on the very first connect this run
+        reconnect_flag = self.reconnect
+        if not reconnect_flag:
+            last_server, last_time = config.load_last_server()
+            if last_server == self.server_ip and time.time() - last_time < config.RECONNECT_WINDOW_SEC:
+                log.debug("Recent prior connection to %s detected — sending HELO reconnect=True",
+                          self.server_ip)
+                reconnect_flag = True
+
+        helo = slimproto.build_helo(self.mac, self._capabilities(), reconnect=reconnect_flag,
                           bytes_received=self.stream_bytes)
         self._send(helo)
-        first_connect = not self.reconnect
         self.reconnect = True
-        log.info("Connected, HELO sent (MAC: %s)", ":".join(f"{b:02x}" for b in self.mac))
+        config.save_last_server(self.server_ip)
+
+        log.info("Connected, HELO sent%s (MAC: %s)",
+                 " [reconnect]" if reconnect_flag else "",
+                 ":".join(f"{b:02x}" for b in self.mac))
         if first_connect:
             print(f"Connected to {self.server_ip}. Ready.", flush=True)
         return True
@@ -1503,7 +1526,11 @@ class Squeezy:
                 self.start_at_jiffies = 0
                 # Reset output_frames so elapsed time starts from zero at the
                 # moment real audio begins — the silence frames don't count.
+                # Also reset _track_start_frames: if a gapless transition set it
+                # to a large value *before* this reset, elapsed would stay stuck
+                # at zero for hundreds of seconds (frames_in_track = 0 - N < 0).
                 self.output_frames = 0
+                self._track_start_frames = 0
                 self._last_frame_update_time = None  # bridge resets with frame counter
                 self._send_stat("STMs")  # Tell LMS track started
 
@@ -1668,6 +1695,7 @@ class Squeezy:
             self.playing = True  # Set before start() — generator checks this immediately
             self.paused = False
             self.output_frames = 0
+            self._track_start_frames = 0  # must match output_frames reset
             self._device_start_time = None   # Reset dynamic delay tracking
             self._device_start_frames = 0
             self._last_frame_update_time = None  # bridge anchor — fresh per device start

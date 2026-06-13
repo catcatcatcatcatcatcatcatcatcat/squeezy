@@ -6,6 +6,7 @@ This module provides functions to save and load player configuration
 """
 
 import os
+import time
 import logging
 
 log = logging.getLogger("squeezy")
@@ -67,3 +68,48 @@ def save_player_name(name):
         log.debug("Saved player name to %s: %s", name_file, name)
     except Exception as e:
         log.warning("Failed to save player name: %s", e)
+
+
+# How long (seconds) after a clean shutdown we still consider it a reconnect.
+# Within this window, HELO is sent with reconnect=True so LMS resumes the
+# player's sync group membership instead of restarting the group.
+RECONNECT_WINDOW_SEC = 3600  # 1 hour
+
+
+def save_last_server(server_ip: str) -> None:
+    """Persist the server IP and current timestamp for reconnect detection.
+
+    Called after every successful HELO so that the next process start can
+    decide whether to send reconnect=True in its own HELO.
+
+    Args:
+        server_ip: The IP address of the LMS server we just connected to.
+    """
+    try:
+        config_dir = get_config_dir()
+        state_file = os.path.join(config_dir, "last_server")
+        with open(state_file, "w") as f:
+            f.write(f"{server_ip}\n{time.time()}\n")
+        log.debug("Saved last server: %s", server_ip)
+    except Exception as e:
+        log.warning("Failed to save last server: %s", e)
+
+
+def load_last_server():
+    """Load the previously connected server IP and connection timestamp.
+
+    Returns:
+        (server_ip, timestamp) tuple where timestamp is a float (Unix time).
+        Returns (None, 0.0) if no state file exists or it cannot be parsed.
+    """
+    try:
+        config_dir = get_config_dir()
+        state_file = os.path.join(config_dir, "last_server")
+        if os.path.exists(state_file):
+            with open(state_file, "r") as f:
+                lines = f.read().strip().split("\n")
+            if len(lines) >= 2:
+                return lines[0].strip(), float(lines[1])
+    except Exception as e:
+        log.warning("Failed to load last server: %s", e)
+    return None, 0.0

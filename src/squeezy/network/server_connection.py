@@ -95,6 +95,28 @@ class ServerConnection:
             except socket.timeout:
                 log.debug("Discovery attempt %d timed out", attempt + 1)
         sock.close()
+
+        # UDP broadcast doesn't reach Docker containers even with port mapping.
+        # Try localhost directly as a unicast probe.
+        log.debug("Broadcast discovery failed; probing localhost (Docker/local LMS)")
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                ls = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                ls.settimeout(slimproto.DISCOVERY_TIMEOUT_SEC)
+                ls.sendto(slimproto.UDP_DISCOVER_PROBE, (host, port))
+                data, addr = ls.recvfrom(slimproto.DISCOVERY_RECV_SIZE)
+                ls.close()
+                if data and data[0:1] == slimproto.UDP_DISCOVER_RESPONSE:
+                    log.info("Found server at %s (localhost probe)", addr[0])
+                    return addr[0]
+            except (OSError, socket.timeout):
+                pass
+            finally:
+                try:
+                    ls.close()
+                except Exception:
+                    pass
+
         return None
 
     def connect(self, server_ip: str) -> bool:

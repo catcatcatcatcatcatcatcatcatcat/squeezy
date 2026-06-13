@@ -1905,7 +1905,7 @@ def check_for_update():
         resp = urlopen("https://pypi.org/pypi/squeezy/json", timeout=3)
         data = json.loads(resp.read())
         latest = data["info"]["version"]
-        if latest != VERSION:
+        if tuple(int(x) for x in latest.split(".")) > tuple(int(x) for x in VERSION.split(".")):
             cmd = _detect_install_method()
             log.warning("squeezy %s is available (you have %s). "
                         "Upgrade: %s", latest, VERSION, cmd)

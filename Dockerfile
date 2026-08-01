@@ -6,7 +6,8 @@ RUN apt-get update -q && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml README.md squeezy.py ./
+COPY pyproject.toml README.md ./
+COPY src/ src/
 COPY tests/ tests/
 RUN pip install --no-cache-dir -e ".[test]"
 

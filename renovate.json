@@ -2,5 +2,25 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "prConcurrentLimit": 5,
+  "packageRules": [
+    {
+      "description": "Group non-major GitHub Action bumps into a single PR and automerge once the Tests workflow is green. Major bumps (e.g. actions/checkout v6 -> v7) still get their own PR and manual review. platformAutomerge is off because the repo has no branch protection, so GitHub's native auto-merge would merge before CI reports back; Renovate waits for green itself instead.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "github-actions (non-major)",
+      "automerge": true,
+      "platformAutomerge": false
+    }
   ]
 }

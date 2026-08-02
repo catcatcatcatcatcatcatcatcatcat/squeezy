@@ -62,7 +62,9 @@ echo "↑ tag v$NEW pushed — GitHub Actions will update Homebrew tap automatic
 echo ""
 echo "Building..."
 rm -rf dist/ build/
-pipx run build
+# The build package's executable is pyproject-build, not build — plain
+# `pipx run build` fails under uv-backed pipx (broke the v0.7.0 release).
+pipx run --spec build pyproject-build
 
 echo ""
 echo "Uploading to PyPI..."

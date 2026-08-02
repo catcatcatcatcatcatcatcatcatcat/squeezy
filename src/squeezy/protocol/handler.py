@@ -26,6 +26,10 @@ from . import slimproto
 
 log = logging.getLogger("squeezy")
 
+# Dedicated sync channel so multi-room timing can be traced without the full
+# firehose of -vv.  `--sync-debug` raises just this logger to INFO.
+synclog = logging.getLogger("squeezy.sync")
+
 
 class ProtocolHandler:
     """Routes and handles incoming SlimProto protocol messages from LMS.
@@ -106,13 +110,31 @@ class ProtocolHandler:
             self._handle_strm_start(msg)
 
         elif command == "p":
-            # Pause — replay_gain field = interval in ms (0 = immediate).
-            # We treat all pauses as immediate (squeezelite does the same).
+            # Pause — replay_gain field carries an interval in ms.
+            #
+            # These are two different commands wearing one opcode
+            # (squeezelite slimproto.c:306-320):
+            #
+            #   interval == 0  real pause.  Stop the device, confirm with STMp.
+            #   interval > 0   sync correction ("hold back N ms").  LMS sends
+            #                  this from _CheckSync to nudge a player that is
+            #                  running ahead of the group.  We must insert N ms
+            #                  of silence and keep playing — and must NOT send
+            #                  STMp, or LMS records us as paused.
             interval = 0
             if len(msg) >= 22:
                 interval = struct.unpack_from(">I", msg, 18)[0]
+
             if interval:
-                log.debug("Pause with interval %d ms (treating as immediate)", interval)
+                # OUTPUT_PAUSE_FRAMES equivalent (squeezelite output.c:86-97)
+                frames = int(interval * self.squeezy.current_sample_rate / 1000)
+                self.squeezy.pause_frames = frames
+                self.squeezy.note_sync_correction()
+                synclog.info("SYNC correction from LMS: pause %dms (%d frames) "
+                             "— holding back, elapsed=%dms",
+                             interval, frames, self.squeezy._elapsed_ms())
+                return
+
             if self.squeezy.playing and not self.squeezy.paused:
                 self.squeezy.paused = True
                 if self.squeezy.device:
@@ -121,7 +143,6 @@ class ProtocolHandler:
                     except Exception:
                         pass
                     self.squeezy.device = None
-            # Always confirm pause to LMS (squeezelite sends STMp regardless of interval)
             self.squeezy._send_stat("STMp")
 
         elif command == "u":
@@ -143,25 +164,47 @@ class ProtocolHandler:
                 self.squeezy.paused = False
                 self.squeezy._resume_audio()
             elif self.squeezy.playing:
-                # LMS-initiated re-sync during active playback.
-                # This is LMS correcting accumulated sync drift — it detected
-                # we were out of step with other players and is giving us a new
-                # start-at-time anchor.  The audio generator will output silence
-                # until target_jiffies, then reset output_frames to 0 and send STMs.
-                elapsed_now = self.squeezy._elapsed_ms()
                 lead_ms = (target_jiffies - now_jiffies) & 0xFFFFFFFF
                 if lead_ms > slimproto.JIFFIES_WRAP_GUARD:
                     lead_ms = 0  # wrapped; treat as immediate
-                log.info(
-                    "SYNC re-sync from LMS: target_jiffies=%d now=%d "
-                    "lead=%dms our_elapsed=%dms",
-                    target_jiffies, now_jiffies, lead_ms, elapsed_now,
-                )
+                if self.squeezy._output_gated:
+                    # The group's coordinated start for a gated gapless switch:
+                    # we sent STMl, every player is ready, and this is the
+                    # shared anchor.  Release the gate; the generator's
+                    # start-at machinery plays silence until the target, then
+                    # starts the track from sample 0 and sends STMs.
+                    self.squeezy._output_gated = False
+                    synclog.info(
+                        "SYNC anchor for gated track: target_jiffies=%d now=%d "
+                        "lead=%dms — starting from sample 0",
+                        target_jiffies, now_jiffies, lead_ms,
+                    )
+                    if not target_jiffies:
+                        # Anchorless release ("start now"): no start-at pass
+                        # will run, so report track start here.
+                        self.squeezy._send_stat("STMs")
+                else:
+                    # LMS-initiated re-anchor during active playback.  The
+                    # generator will insert silence until target_jiffies —
+                    # note this can only *delay* our audio; frames already
+                    # consumed can't be rewound (the generator logs a warning
+                    # if that happens and keeps elapsed truthful).
+                    elapsed_now = self.squeezy._elapsed_ms()
+                    self.squeezy.note_sync_correction()
+                    synclog.info(
+                        "SYNC re-anchor from LMS: target_jiffies=%d now=%d "
+                        "lead=%dms our_elapsed=%dms",
+                        target_jiffies, now_jiffies, lead_ms, elapsed_now,
+                    )
             else:
                 # Not yet playing (sync mode: we sent STMl, LMS now says start).
-                log.debug("strm u: sync start, target_jiffies=%d now=%d lead=%dms",
-                          target_jiffies, now_jiffies,
-                          (target_jiffies - now_jiffies) & 0xFFFFFFFF)
+                # `lead` is how far ahead LMS placed the shared start moment.  A
+                # negative/huge value means LMS's idea of our clock (its latched
+                # jiffies epoch) disagrees with gettime_ms() — see the clock-step
+                # warning in squeezy.py.
+                synclog.info("SYNC start anchor: target_jiffies=%d now=%d lead=%dms",
+                             target_jiffies, now_jiffies,
+                             (target_jiffies - now_jiffies) & 0xFFFFFFFF)
                 if self.squeezy.pcm_buf.available() > 0:
                     if target_jiffies:
                         self.squeezy._start_audio_at_time()
@@ -170,7 +213,16 @@ class ProtocolHandler:
             self.squeezy._send_stat("STMr")
 
         elif command == "a":
-            # Skip ahead — replay_gain field = milliseconds to skip
+            # Skip ahead — replay_gain field = milliseconds to drop.
+            # The other half of LMS's _CheckSync correction: drop N ms of
+            # buffered audio so a player that is running behind catches up.
+            #
+            # squeezelite replies with nothing here (slimproto.c:322-330).  We
+            # used to send STMc, which LMS reads as "reconnecting to the stream
+            # server" — it clears readyToStream and bufferReady and sets
+            # connecting(1) until an HTTP RESP arrives (Squeezebox2.pm:141-180).
+            # That never comes during a skip, so the correction left LMS with a
+            # wedged view of our stream state.
             if len(msg) >= 22:
                 skip_ms = struct.unpack_from(">I", msg, 18)[0]
                 skip_frames = int(skip_ms * self.squeezy.current_sample_rate / 1000)
@@ -178,9 +230,11 @@ class ProtocolHandler:
                 actual = self.squeezy.pcm_buf.skip(skip_bytes)
                 skipped_frames = actual // slimproto.BYTES_PER_FRAME
                 self.squeezy.output_frames += skipped_frames
-                log.debug("Skip ahead: %d ms (%d frames requested, %d skipped)",
-                         skip_ms, skip_frames, skipped_frames)
-            self.squeezy._send_stat("STMc")
+                self.squeezy.note_sync_correction()
+                synclog.info("SYNC correction from LMS: skip ahead %dms "
+                             "(%d frames requested, %d available) elapsed=%dms",
+                             skip_ms, skip_frames, skipped_frames,
+                             self.squeezy._elapsed_ms())
 
         elif command == "q":
             # Quit streaming entirely — hard stop, always report completion.

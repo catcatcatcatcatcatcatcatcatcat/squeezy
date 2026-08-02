@@ -18,7 +18,7 @@ A minimal Python reimplementation of **squeezelite** — a software player for
 
 ## Current version
 
-**v0.4.0** on PyPI / Homebrew.
+**v0.7.0** on PyPI / Homebrew.
 
 ---
 
@@ -81,6 +81,53 @@ LMS → strm 'u' (jiffies=T)    →  start audio, play silence until time T
 at time T → real audio starts   →  send STMs
 ```
 
+### How drift correction actually works (and what it depends on)
+
+LMS runs a periodic drift check for synced groups:
+`StreamingController.pm::_CheckSync` — every 0.95s, corrects deltas between
+10ms and 10s via `skipAhead` (strm a) / `pauseForInterval` (strm p interval).
+For `AccuratePlayPoints=1` players (us, squeezelite) the play-point is computed
+**directly from our STAT reports**: `Squeezebox2::playPoint` =
+`jiffiesToTimestamp(jiffies) − elapsed_ms/1000`.
+
+**Consequence: LMS's entire view of our sync position is the `elapsed_ms` we
+report.** It cannot hear the room. If reported elapsed disagrees with the
+audio actually coming out of the DAC, LMS "corrects" toward the report and the
+audible offset persists. Truthful elapsed reporting is load-bearing for sync —
+never reset `output_frames`/`_track_start_frames` in a way that hides audio
+already consumed (the start-at handler guards this and logs a warning).
+The player itself has no self-check; squeezelite doesn't either.
+
+The three corrections LMS can send, all in the replay_gain field:
+| Packet | Meaning | Our handling |
+|--------|---------|--------------|
+| `strm p` interval>0 | hold back N ms | `pause_frames` → silence in the generator |
+| `strm a` interval | drop N ms | `pcm_buf.skip()`, no STAT reply |
+| `strm u` jiffies | (re)anchor start time | `start_at_jiffies` → silence until T |
+
+### Synced track boundaries: the output gate (don't regress)
+
+Synced groups do NOT get gapless transitions. At each track boundary LMS
+re-coordinates the whole group (`_WaitToSync` → all players STMl →
+`_syncStart` anchors everyone at now + `syncStartDelay` [200ms default] via
+`strm u`). Each player must start the new track **from sample 0 at the anchor
+time**.
+
+squeezelite gets this for free from its output state machine: output goes
+`OUTPUT_STOPPED` at drain and plays silence even with a full buffer
+(output.c:112) until autostart=1 threshold or a strm-u anchor starts it.
+
+Our generator keeps the device hot across gapless switches, so it needs the
+explicit equivalent: `_output_gated`. Set at the gapless switch when the
+queued track's autostart != 1; while gated the generator yields silence and
+consumes nothing, `_check_threshold_start` sends STMl (autostart 0) or
+releases the gate (autostart ≥1 after CONT), and the strm-u anchor releases it
+for a sample-0 start. **Playing even one early frame is unrecoverable** — the
+anchor can only delay consumption, never rewind it, so a head start becomes a
+constant audible offset for the entire track (this was a real bug: ~426ms
+ahead after every synced track transition). Also: periodic STMt is suppressed
+while gated (squeezelite only sends STMt in `OUTPUT_RUNNING`).
+
 ---
 
 ## Critical bugs fixed (don't regress these)
@@ -104,6 +151,21 @@ squeezelite does the same — without it, LMS doesn't acknowledge the pause.
 `self.playing = True` must be set **before** `device.start(gen)` because on
 Linux the miniaudio callback fires immediately and the generator checks
 `self.playing` before yielding any data.
+
+### strm 'p' interval is a sync correction, not a pause
+`strm p` carries an interval in the replay_gain field and means two different
+things (squeezelite `slimproto.c:306-320`):
+- `interval == 0` — real pause. Stop the device, reply STMp.
+- `interval > 0`  — "hold back N ms". Insert silence via `pause_frames`, keep
+  the device running, and send **no** STMp. Replying STMp makes LMS record the
+  player as paused mid-correction.
+
+### Never send STMc outside stream connect
+LMS reads STMc as "connecting to the stream server": it clears `readyToStream`
+and `bufferReady` and sets `connecting(1)`, cleared only by an HTTP RESP
+(`Squeezebox2.pm:141-180`). We used to send it from the `strm a` (skip-ahead)
+handler, which wedged LMS's view of our stream state on every sync correction.
+squeezelite replies with nothing to `strm a`.
 
 ### Sync: STMl never sent (fixed)
 For `autostart=0` (sync mode, after CONT decrements from 2), we must send
@@ -138,12 +200,13 @@ PCM_BUF_MAX_SIZE = 4MB       # PCMBuffer default max (~23s at 44.1k stereo)
 
 ## Testing
 
-**84 unit tests + 14 integration = 98 total:**
+**113 unit tests + 14 integration = 127 total:**
 ```bash
 PYTHONPATH=src python3 -m pytest tests/                        # all unit tests
 PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 only
 PYTHONPATH=src python3 -m pytest tests/test_p2_features.py     # P2 only
 PYTHONPATH=src python3 -m pytest tests/test_p3_robustness.py   # P3 only
+PYTHONPATH=src python3 -m pytest tests/test_sync.py            # sync/timing only
 make test                                                       # shortcut
 ```
 
@@ -154,6 +217,9 @@ make test                                                       # shortcut
 - P1 Reliability (14 tests) — connection, heartbeat, state management
 - P2 Features (41 tests) — gapless, crossfade, replay gain, ICY metadata, sample rate
 - P3 Robustness (29 tests) — MP3 gapless, PCMBuffer edge cases, DSCO, graceful shutdown
+- Sync (29 tests) — pause-interval, skip-ahead, pause-frames in the generator,
+  the gapless output gate (synced boundaries), truthful anchor elapsed,
+  clock-step and audio-stall detection
 - Integration (14 tests) — end-to-end with real LMS
 
 ---
@@ -165,6 +231,8 @@ make test                                                       # shortcut
 ./run.sh -n "Squeezy" -vv          # debug logging
 ./run.sh -n "Squeezy" -v           # info logging
 ./run.sh -n "Squeezy" --latency 45 # tune sync offset
+./run.sh -n "Squeezy" --sync-debug # sync/timing diagnostics only (quiet enough
+                                   #   to leave running overnight)
 ./run.sh -l                        # list audio devices
 
 # Or manually:

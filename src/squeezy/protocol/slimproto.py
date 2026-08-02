@@ -132,6 +132,23 @@ SYNC_START_WINDOW_MS = 10000     # Max ms into future we'll wait for sync target
 JIFFIES_WRAP_GUARD = 0x7FFFFFFF  # Half of u32 range — values above this in a
                                  # diff indicate the target is in the past (wrapped)
 
+# Diagnostics thresholds (see the "SYNC" log lines in squeezy.py).
+#
+# CLOCK_STEP_WARN_MS — gettime_ms() is built on the wall clock, which is what
+# LMS latches as this player's "jiffies epoch".  If (wall - monotonic) moves,
+# either the system clock was stepped (NTP) or the process was suspended
+# (laptop sleep).  Both silently invalidate LMS's epoch for us, so every
+# start-at-time target it computes afterwards lands at the wrong moment.
+# LMS only re-latches quickly on a fresh connection, or creeps back at
+# 1-5ms per 10-50 STAT packets (Slim::Player::Player::trackJiffiesEpoch).
+CLOCK_STEP_WARN_MS = 100
+
+# AUDIO_STALL_WARN_SEC — how long output_frames may stall *while PCM data is
+# waiting* before we conclude the audio device stopped consuming.  A device
+# that survives macOS sleep as an object but whose CoreAudio callback never
+# fires again looks exactly like this: buffer full, frames frozen, no sound.
+AUDIO_STALL_WARN_SEC = 3.0
+
 # ---------------------------------------------------------------------------
 # SETD (Set Data) protocol IDs
 # ---------------------------------------------------------------------------

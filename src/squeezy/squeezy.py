@@ -65,6 +65,11 @@ from .protocol import handler as protocol_handler
 
 log = logging.getLogger("squeezy")
 
+# Sync/timing diagnostics live on their own logger so `--sync-debug` can turn
+# them on without the rest of -vv.  Everything that affects where our audio
+# lands in time relative to LMS and other players logs here.
+synclog = logging.getLogger("squeezy.sync")
+
 VERSION = pkg_version("squeezy")
 
 
@@ -158,6 +163,21 @@ class Squeezy:
         self.playing = False
         self.paused = False
         self.start_at_jiffies = 0
+        # Frames of silence still owed to LMS from a 'strm p' sync correction
+        # (squeezelite's output.pause_frames).  Written by the main thread,
+        # consumed by the audio generator.
+        self.pause_frames = 0
+        # Output gate — our equivalent of squeezelite's OUTPUT_STOPPED/BUFFER
+        # states.  squeezelite's output plays silence even with a full buffer
+        # until something starts it (output.c:112: state <= OUTPUT_BUFFER →
+        # silence); only an autostart=1 threshold or a strm-u anchor flips it
+        # to RUNNING.  Our generator used to conflate "device open" with
+        # "consume the buffer", so at a *synced* track boundary (gapless
+        # switch with queued autostart 0/2) it played the next track's audio
+        # immediately instead of waiting for the group's strm-u anchor —
+        # putting us a fixed few hundred ms ahead of the group for the whole
+        # track.  While gated: yield silence, consume nothing, elapsed stays 0.
+        self._output_gated = False
         self.output_frames = 0
         self.volume = 1.0  # 0.0–1.0, set by audg from LMS
         self.replay_gain = 1.0  # 1.0 = unity, set from strm 's' packet (16.16 fixed-point)
@@ -245,6 +265,23 @@ class Squeezy:
         self._last_statt_elapsed = None # elapsed_ms reported in last STMt
         self._sync_drift_accum = 0.0   # running total drift (ms) since track start
         self._statt_count = 0           # heartbeats sent this track (for periodic log)
+
+        # Clock-step / suspend detection.  gettime_ms() (the jiffies we report
+        # to LMS) rides the wall clock; monotonic does not.  Their difference is
+        # constant unless the clock is stepped or the process is suspended.
+        self._clock_offset = time.time() - time.monotonic()
+        self._clock_steps = 0           # how many steps seen since start
+
+        # Observed audio callback geometry — miniaudio only echoes back the
+        # buffer size we *asked* for (buffersize_msec is never updated from the
+        # device), so the only honest source for the real period is how many
+        # frames the callback actually asks for.
+        self._cb_period_frames = 0      # frames requested by the last callback
+        self._cb_count = 0
+        self._audio_stalled = False     # latch so the stall warning fires once
+
+        # Count of sync corrections LMS has sent us this run (strm p/a/u)
+        self._sync_corrections = 0
 
         self._send_lock = threading.Lock()
 
@@ -443,26 +480,33 @@ class Squeezy:
                 #   device_buf     — actual miniaudio buffer (ms); drives delay compensation
                 #   delay_comp     — total delay subtracted from elapsed (device_buf + pipeline)
                 if self._statt_count % 10 == 0 or abs(tick_drift) > 20:
-                    frames_in_track = self.output_frames - self._track_start_frames
-                    device_buf_ms = (self.device.buffersize_msec
-                                     if self.device else slimproto.DEVICE_BUFFER_MSEC)
-                    delay_ms = device_buf_ms + self.pipeline_latency_msec
-                    # bridge_ms: how much wall-clock the elapsed report bridges
-                    # past the last frame update.  >50ms means the buffer was
-                    # silent (underrun / silence-pad) for that long and the
-                    # bridge is keeping elapsed honest.
+                    # cb_ms: the period the audio device *actually* asks for.
+                    #   We compensate elapsed by a fixed DEVICE_BUFFER_MSEC
+                    #   (40).  If cb_ms is far from that, the compensation —
+                    #   and therefore where our audio sits in time — is wrong
+                    #   by the difference.  This is the number to check first
+                    #   when one machine sits at a constant offset.
+                    # bridge: how much wall-clock the elapsed report bridges
+                    #   past the last frame update.  >50ms means the buffer was
+                    #   silent (underrun / silence-pad) for that long and the
+                    #   bridge is keeping elapsed honest.
                     if self._last_frame_update_time is not None:
                         bridge_ms = (now_wall - self._last_frame_update_time) * 1000.0
                     else:
                         bridge_ms = 0.0
-                    log.debug(
+                    cb_ms = (self._cb_period_frames * 1000.0 / self.current_sample_rate
+                             if self._cb_period_frames else 0.0)
+                    synclog.info(
                         "SYNC elapsed=%dms wall_Δ=%.1fms elapsed_Δ=%.1fms "
                         "tick_drift=%.1fms accum_drift=%.1fms bridge=%.1fms "
-                        "rate=%d buf_avail=%d device_buf=%dms delay_comp=%dms",
+                        "rate=%d buf_avail=%d cb=%.1fms(%d fr) "
+                        "delay_comp=%dms corrections=%d clock_steps=%d",
                         elapsed, wall_delta_ms, elapsed_delta_ms,
                         tick_drift, self._sync_drift_accum, bridge_ms,
                         self.current_sample_rate, self.pcm_buf.available(),
-                        device_buf_ms, delay_ms,
+                        cb_ms, self._cb_period_frames,
+                        slimproto.DEVICE_BUFFER_MSEC + self.pipeline_latency_msec,
+                        self._sync_corrections, self._clock_steps,
                     )
             self._last_statt_wall = now_wall
             self._last_statt_elapsed = elapsed
@@ -485,6 +529,82 @@ class Squeezy:
             server_timestamp=server_timestamp,
         )
         self._send(pkt)
+
+    def note_sync_correction(self):
+        """Record that LMS sent us a timing correction (strm p / a / u).
+
+        Called from the protocol handler.  The count rides along in the periodic
+        SYNC line so a log can be read as "LMS nudged us N times" without
+        grepping for the individual events.
+        """
+        self._sync_corrections += 1
+
+    def _check_clock_step(self):
+        """Detect wall-clock steps and process suspension (e.g. laptop sleep).
+
+        We report ``gettime_ms()`` — the wall clock — to LMS as our jiffies, and
+        LMS latches that into a per-player epoch it uses to convert its own
+        clock into ours when it computes start-at-time targets
+        (Slim::Player::Player::trackJiffiesEpoch / jiffiesToTimestamp).
+
+        That epoch is only re-latched fast when the offset moves *down*, or on a
+        fresh connection.  Upward moves creep back at 1-5ms per 10-50 STAT
+        packets, so a clock step during sleep can leave every subsequent sync
+        anchor landing at the wrong moment for a long time.
+
+        ``time.time() - time.monotonic()`` is constant while nothing unusual
+        happens.  It moves when the clock is stepped (NTP resync on wake) and —
+        on macOS, where monotonic is ``mach_absolute_time()`` and does not run
+        while the machine is asleep — by the whole duration of a sleep.
+
+        Returns:
+            Step size in ms (signed), or 0.0 if the clock is steady.
+        """
+        offset = time.time() - time.monotonic()
+        step_ms = (offset - self._clock_offset) * 1000.0
+        if abs(step_ms) < slimproto.CLOCK_STEP_WARN_MS:
+            return 0.0
+
+        self._clock_offset = offset
+        self._clock_steps += 1
+        synclog.warning(
+            "SYNC clock step %+.0fms (%.1fs) — wall clock moved relative to "
+            "monotonic: system sleep or NTP resync. Our jiffies just jumped "
+            "by this much; LMS's latched epoch for this player is now stale "
+            "and sync anchors will be off until it re-latches (reconnect).",
+            step_ms, step_ms / 1000.0,
+        )
+        return step_ms
+
+    def _check_audio_stall(self):
+        """Warn when the audio device stops consuming while PCM data is waiting.
+
+        A miniaudio device can survive a macOS sleep as a live Python object
+        while its CoreAudio callback never fires again.  The signature is
+        unambiguous: the PCM buffer has data, but ``output_frames`` is frozen.
+        Distinguishing this from an ordinary network underrun is exactly why we
+        require ``available() > 0`` before warning.
+        """
+        if not self.playing or self.paused or self._last_frame_update_time is None:
+            self._audio_stalled = False
+            return
+        if self.pcm_buf.available() <= 0:
+            return  # starved by the network, not a dead device
+
+        stalled_sec = time.monotonic() - self._last_frame_update_time
+        if stalled_sec < slimproto.AUDIO_STALL_WARN_SEC:
+            self._audio_stalled = False
+            return
+        if self._audio_stalled:
+            return  # already reported this stall
+
+        self._audio_stalled = True
+        synclog.warning(
+            "SYNC audio device stalled: no frames consumed for %.1fs with "
+            "%d bytes ready to play — the output callback has stopped firing "
+            "(device lost across sleep/device change?). Elapsed time is frozen.",
+            stalled_sec, self.pcm_buf.available(),
+        )
 
     def _format_elapsed(self, elapsed_ms):
         """Convert milliseconds to MM:SS format for readable logging."""
@@ -702,12 +822,23 @@ class Squeezy:
         expect_len = None
         timeouts = 0
         last_status = 0
+        last_health = 0
 
         while self.running:
             # Periodic STMt heartbeat — LMS uses these to track elapsed time
             # and drive the progress bar.  squeezelite sends every ~1 second.
             now = time.time()
-            if self.playing and not self.paused and now - last_status > 1.0:
+            if now - last_health > 1.0:
+                # Run once a second whether or not we're playing — a sleep that
+                # happens while idle still invalidates LMS's clock epoch for us.
+                self._check_clock_step()
+                self._check_audio_stall()
+                last_health = now
+            # Periodic STMt only while output is actually running — squeezelite
+            # gates this on OUTPUT_RUNNING (slimproto.c:734), so a buffering /
+            # gated player goes quiet between event STATs.
+            if (self.playing and not self.paused and not self._output_gated
+                    and now - last_status > 1.0):
                 self._send_stat("STMt")
                 last_status = now
 
@@ -1133,8 +1264,16 @@ class Squeezy:
 
         Uses self.autostart (live value, updated by CONT handler) rather than
         the hint passed in at stream-start time, since CONT changes it.
+
+        Two states can reach here:
+          - Fresh start: device not running (playing=False).  autostart≥1
+            starts the device; autostart=0 sends STMl.
+          - Gated gapless: device running but the output gate is holding the
+            queued track back (playing=True, _output_gated=True).  autostart≥1
+            (e.g. 3 after CONT → 1) releases the gate; autostart=0 sends STMl
+            and stays gated until the strm-u anchor.
         """
-        if self.playing or self.sent_STMl:
+        if self.sent_STMl or (self.playing and not self._output_gated):
             return  # Already started or signalled
 
         avail = self.pcm_buf.available()
@@ -1145,13 +1284,21 @@ class Squeezy:
         autostart = self.autostart
 
         if autostart >= 1:
-            # Normal mode: start audio immediately
-            self._start_audio()
+            if self.playing:
+                # Gated gapless switch, self-start allowed: release the gate.
+                # The device is already hot; the generator begins consuming on
+                # its next callback — squeezelite's OUTPUT_BUFFER → RUNNING.
+                self._output_gated = False
+                synclog.info("SYNC gate released at threshold (autostart=%d)", autostart)
+            else:
+                # Normal mode: start audio immediately
+                self._start_audio()
             self._send_stat("STMs")
         elif autostart == 0 and not self.sent_STMl:
             # Sync mode: signal readiness to LMS, don't start audio yet.
             # LMS will send 'strm u' with jiffies once all synced players
-            # have reported STMl.
+            # have reported STMl.  (If we're a gated gapless switch, the gate
+            # stays closed — the anchor releases it.)
             self.sent_STMl = True
             log.info("Buffer threshold reached — signalling ready (STMl) for sync")
             self._send_stat("STMl")
@@ -1176,7 +1323,11 @@ class Squeezy:
 
                 if not started and self.cont_received:
                     self._check_threshold_start(threshold, autostart)
-                    started = self.playing or self.sent_STMl
+                    # "Started" must see through the output gate: during a
+                    # gated gapless switch the device is running (playing=True)
+                    # but the queued track hasn't started — keep checking the
+                    # threshold so STMl / gate-release can fire.
+                    started = self.sent_STMl or (self.playing and not self._output_gated)
 
             except socket.timeout:
                 continue
@@ -1316,7 +1467,11 @@ class Squeezy:
                 # Check threshold for auto-start or sync readiness
                 if not started and self.cont_received:
                     self._check_threshold_start(threshold, autostart)
-                    started = self.playing or self.sent_STMl
+                    # "Started" must see through the output gate: during a
+                    # gated gapless switch the device is running (playing=True)
+                    # but the queued track hasn't started — keep checking the
+                    # threshold so STMl / gate-release can fire.
+                    started = self.sent_STMl or (self.playing and not self._output_gated)
 
             except Exception as e:
                 log.debug("Decode reader exception: %s", e)
@@ -1488,11 +1643,59 @@ class Squeezy:
         """
         required_frames = yield b""  # priming yield
         while self.playing and self.running:
+            # Record the real callback geometry.  miniaudio's buffersize_msec
+            # is only the value we requested — it is never updated from the
+            # device — so the frame count CoreAudio/ALSA actually asks for is
+            # our only honest measure of the device period.  A period that
+            # differs from DEVICE_BUFFER_MSEC means _elapsed_ms()'s fixed delay
+            # compensation is off by that difference, which shows up as a
+            # constant sync offset.
+            if required_frames != self._cb_period_frames:
+                prev = self._cb_period_frames
+                self._cb_period_frames = required_frames
+                if self._cb_count:  # not the first callback — geometry changed
+                    synclog.info(
+                        "SYNC audio callback period changed: %d → %d frames "
+                        "(%.1fms → %.1fms at %dHz; we compensate elapsed by a "
+                        "fixed %dms)",
+                        prev, required_frames,
+                        prev * 1000.0 / self.current_sample_rate,
+                        required_frames * 1000.0 / self.current_sample_rate,
+                        self.current_sample_rate, slimproto.DEVICE_BUFFER_MSEC,
+                    )
+            self._cb_count += 1
+
             if self.paused:
                 required_frames = yield b"\x00" * (required_frames * slimproto.BYTES_PER_FRAME)
                 continue
 
-            required_bytes = required_frames * slimproto.BYTES_PER_FRAME
+            # Output gate (squeezelite OUTPUT_STOPPED): the device stays hot
+            # across a gapless boundary, but if the queued track needs a
+            # coordinated start we must not consume its audio yet.  The gate
+            # is released by _check_threshold_start (autostart≥1 after CONT)
+            # or by the strm-u handler (sync anchor).
+            if self._output_gated:
+                required_frames = yield b"\x00" * (required_frames * slimproto.BYTES_PER_FRAME)
+                continue
+
+            full_bytes = required_frames * slimproto.BYTES_PER_FRAME
+            required_bytes = full_bytes
+
+            # Sync correction: LMS sent 'strm p' with an interval, asking us to
+            # hold back.  Emit that many frames of silence *without* consuming
+            # the PCM buffer, so the audio lands later by exactly the interval
+            # (squeezelite's OUTPUT_PAUSE_FRAMES, output.c:86-97).  These frames
+            # deliberately don't count toward output_frames — elapsed time must
+            # not advance for audio we haven't played yet.
+            pause_prefix = b""
+            if self.pause_frames > 0:
+                held = min(required_frames, self.pause_frames)
+                self.pause_frames -= held
+                pause_prefix = b"\x00" * (held * slimproto.BYTES_PER_FRAME)
+                required_bytes -= len(pause_prefix)
+                if required_bytes == 0:
+                    required_frames = yield pause_prefix
+                    continue
 
             # Sync: if start_at_jiffies is set, output silence until target time
             # (like squeezelite's OUTPUT_START_AT state)
@@ -1508,7 +1711,7 @@ class Squeezy:
                 if (diff < slimproto.JIFFIES_WRAP_GUARD
                         and diff > 0
                         and diff < slimproto.SYNC_START_WINDOW_MS):
-                    required_frames = yield b"\x00" * required_bytes
+                    required_frames = yield b"\x00" * full_bytes
                     continue
                 # Target reached or passed — clear and start real audio.
                 # overshoot_ms: how many ms after the target we actually started.
@@ -1529,9 +1732,27 @@ class Squeezy:
                 # Also reset _track_start_frames: if a gapless transition set it
                 # to a large value *before* this reset, elapsed would stay stuck
                 # at zero for hundreds of seconds (frames_in_track = 0 - N < 0).
-                self.output_frames = 0
-                self._track_start_frames = 0
-                self._last_frame_update_time = None  # bridge resets with frame counter
+                #
+                # ONLY valid if we haven't consumed any of this track yet.  If
+                # frames were already played before the anchor (should not
+                # happen now that gapless switches gate on autostart), zeroing
+                # the counters would make our reported elapsed lie by exactly
+                # that head start — and LMS's _CheckSync measures us purely by
+                # reported elapsed (Squeezebox2::playPoint), so it would
+                # "verify" us as in sync while the room is audibly off.
+                frames_consumed = self.output_frames - self._track_start_frames
+                if frames_consumed <= 0:
+                    self.output_frames = 0
+                    self._track_start_frames = 0
+                    self._last_frame_update_time = None  # bridge resets with frame counter
+                else:
+                    synclog.warning(
+                        "SYNC anchor fired with %d frames (%.0fms) already "
+                        "consumed — cannot rewind; keeping elapsed truthful so "
+                        "LMS can correct the offset",
+                        frames_consumed,
+                        frames_consumed * 1000.0 / self.current_sample_rate,
+                    )
                 self._send_stat("STMs")  # Tell LMS track started
 
             avail = self.pcm_buf.available()
@@ -1592,7 +1813,7 @@ class Squeezy:
                         for i in range(len(samples)):
                             samples[i] = int(samples[i] * vol)
                         chunk = samples.tobytes()
-                    required_frames = yield chunk
+                    required_frames = yield pause_prefix + chunk
                     continue
 
             # Buffer empty — bail immediately during shutdown
@@ -1621,6 +1842,22 @@ class Squeezy:
                     self.stream_bytes = 0
                     self.cont_received = (autostart < 2)
                     self.autostart = autostart
+                    # Honour the queued track's autostart (squeezelite: output
+                    # goes OUTPUT_STOPPED at drain; only autostart=1 restarts
+                    # it on its own).  autostart 0/2 = synced start — buffer,
+                    # send STMl at threshold, and wait for the strm-u anchor
+                    # before consuming a single frame.  Playing early here is
+                    # unrecoverable: the anchor can only delay consumption,
+                    # never rewind it, so a head start becomes a constant
+                    # offset for the entire track.
+                    self._output_gated = (autostart != 1)
+                    if self._output_gated:
+                        synclog.info(
+                            "SYNC gapless switch gated: queued autostart=%d — "
+                            "buffering, waiting for %s before output",
+                            autostart,
+                            "CONT + threshold" if autostart >= 2 else "strm-u anchor",
+                        )
                     # Start stream thread for new track (device already running)
                     self.stream_thread = threading.Thread(
                         target=self._stream_worker,
@@ -1629,7 +1866,7 @@ class Squeezy:
                     )
                     self.stream_thread.start()
                     # Loop continues, waiting for new data
-                    required_frames = yield b"\x00" * required_bytes
+                    required_frames = yield b"\x00" * full_bytes
                     continue
                 else:
                     # No pending track — playback finished
@@ -1643,7 +1880,7 @@ class Squeezy:
                 self._send_stat("STMo")
 
             # Yield silence while waiting for data
-            required_frames = yield b"\x00" * required_bytes
+            required_frames = yield b"\x00" * full_bytes
 
         # Generator exiting — playback stopped (no pending track)
         self.playing = False
@@ -1696,6 +1933,10 @@ class Squeezy:
             self.paused = False
             self.output_frames = 0
             self._track_start_frames = 0  # must match output_frames reset
+            self.pause_frames = 0
+            self._cb_period_frames = 0    # re-measure geometry for this device
+            self._cb_count = 0
+            self._audio_stalled = False
             self._device_start_time = None   # Reset dynamic delay tracking
             self._device_start_frames = 0
             self._last_frame_update_time = None  # bridge anchor — fresh per device start
@@ -1791,6 +2032,9 @@ class Squeezy:
         self.playing = False
         self.paused = False
         self.output_frames = 0
+        self.pause_frames = 0     # drop any unfinished sync hold-back
+        self._output_gated = False
+        self._audio_stalled = False
         self.decode_complete = False
         self._pending_track = None
         self._device_start_time = None
@@ -1928,6 +2172,10 @@ def main():
                              "Larger buffers help on slow networks, smaller reduces latency.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase verbosity (-v info, -vv debug)")
+    parser.add_argument("--sync-debug", action="store_true",
+                        help="Log multi-room sync/timing diagnostics (drift per heartbeat, "
+                             "LMS corrections, clock steps, audio-device stalls) without "
+                             "the rest of -vv. Safe to leave on long-term.")
     parser.add_argument("--version", action="version", version=f"squeezy {VERSION}")
     args = parser.parse_args()
 
@@ -1943,6 +2191,12 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # The sync channel is a child of "squeezy", so it reaches the same handler.
+    # basicConfig's handler has no level of its own, so lowering this logger's
+    # level is enough to let SYNC lines through while the rest stays quiet.
+    if args.sync_debug:
+        synclog.setLevel(logging.INFO)
 
     # Non-blocking update check
     threading.Thread(target=check_for_update, daemon=True).start()

@@ -1,0 +1,59 @@
+name: Docker
+
+# The root Dockerfile is the Linux dev image documented in DEVELOPER.md. No
+# other workflow builds it — the `integration` job in test.yml only consumes
+# the upstream LMS image as a service — so without this job a broken Dockerfile
+# reports green. That is exactly how it stayed broken from April to August:
+# the src/ layout refactor invalidated its COPY and nothing noticed.
+#
+# Path-gated so ordinary pushes don't pay for a Docker build. The listed paths
+# are the build's actual inputs, which means Renovate base-image bumps (they
+# touch the Dockerfile) always get a check that means something.
+#
+# The two path lists are duplicated on purpose: GitHub Actions does not support
+# YAML anchors, so they cannot be shared. Keep them in sync.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'src/**'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'src/**'
+      - '.github/workflows/docker.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build dev image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t squeezy-dev .
+
+      # Catches a build that succeeds but installs a package the entry point
+      # can't import — the failure mode a plain `docker build` would miss.
+      - name: Verify entry point
+        run: |
+          docker run --rm squeezy-dev squeezy --version
+          docker run --rm squeezy-dev squeezy --help
+
+      # The image ships tests/ and the [test] extra specifically so it can serve
+      # as the Linux test environment DEVELOPER.md advertises. Assert that works.
+      # tests/ is deliberately not a path trigger: these same tests already run
+      # in test.yml, so what's unique here is that the *container* can run them,
+      # which only breaks via the Dockerfile or pyproject changes listed above.
+      - name: Run unit tests in image
+        run: >
+          docker run --rm squeezy-dev
+          python -m pytest tests/test_p1_reliability.py tests/test_p2_features.py
+          tests/test_p3_robustness.py -q --timeout=60

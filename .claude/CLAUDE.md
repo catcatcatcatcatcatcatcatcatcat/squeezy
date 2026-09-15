@@ -18,7 +18,7 @@ A minimal Python reimplementation of **squeezelite** — a software player for
 
 ## Current version
 
-**v0.7.0** on PyPI / Homebrew.
+**v0.8.0** on PyPI / Homebrew.
 
 ---
 

@@ -96,6 +96,22 @@ squeezy --version
 
 Your player will appear in the Lyrion Music Server web UI. Select it from the player dropdown to start streaming.
 
+### macOS: `Connection failed: [Errno 65] No route to host`
+
+If squeezy can't reach LMS (or discovery finds nothing) while the server is
+plainly up, macOS is refusing **Local Network** access for Python. The
+permission is judged per process, terminals such as iTerm2 don't pass their own
+grant on to the programs they run, and macOS never shows a prompt for that
+case — it just denies. Trigger the prompt directly:
+
+```bash
+squeezy --request-local-network -s 192.168.1.100   # click Allow when macOS asks
+```
+
+The grant is tied to the exact Python binary, so repeat this after upgrading
+Python (e.g. `brew upgrade`). You can also toggle Python on under
+System Settings → Privacy & Security → Local Network.
+
 ## Project Structure
 
 ```
@@ -109,6 +125,7 @@ src/squeezy/
 │   └── lms_client.py       # LMS message operations
 ├── network/
 │   ├── server_connection.py # TCP/UDP socket management & discovery
+│   ├── local_network.py    # macOS Local Network permission hint & prompt trigger
 │   ├── lms_metadata.py     # LMS JSON-RPC track metadata queries
 │   └── status_server.py    # Unix socket status server
 └── config/

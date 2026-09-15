@@ -36,6 +36,7 @@ src/squeezy/
 │   └── lms_client.py           # SlimProto message sending (HELO, STAT, DSCO, etc.)
 ├── network/
 │   ├── server_connection.py    # TCP/UDP socket management, discovery
+│   ├── local_network.py        # macOS Local Network denial hint + prompt trigger
 │   ├── lms_metadata.py         # LMS JSON-RPC track metadata queries
 │   └── status_server.py        # Unix socket status server for external tools
 └── config/
@@ -200,13 +201,14 @@ PCM_BUF_MAX_SIZE = 4MB       # PCMBuffer default max (~23s at 44.1k stereo)
 
 ## Testing
 
-**113 unit tests + 14 integration = 127 total:**
+**137 unit tests + 14 integration = 151 total:**
 ```bash
 PYTHONPATH=src python3 -m pytest tests/                        # all unit tests
 PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 only
 PYTHONPATH=src python3 -m pytest tests/test_p2_features.py     # P2 only
 PYTHONPATH=src python3 -m pytest tests/test_p3_robustness.py   # P3 only
 PYTHONPATH=src python3 -m pytest tests/test_sync.py            # sync/timing only
+PYTHONPATH=src python3 -m pytest tests/test_local_network.py   # macOS Local Network only
 make test                                                       # shortcut
 ```
 
@@ -220,6 +222,9 @@ make test                                                       # shortcut
 - Sync (29 tests) — pause-interval, skip-ahead, pause-frames in the generator,
   the gapless output gate (synced boundaries), truthful anchor elapsed,
   clock-step and audio-stall detection
+- Local Network (24 tests) — EHOSTUNREACH hint classification, hint logged once
+  from connect() and from discovery, probe exit codes, disclaimed re-spawn (macOS only),
+  `--request-local-network` / `--local-network-probe` CLI wiring
 - Integration (14 tests) — end-to-end with real LMS
 
 ---
@@ -234,6 +239,8 @@ make test                                                       # shortcut
 ./run.sh -n "Squeezy" --sync-debug # sync/timing diagnostics only (quiet enough
                                    #   to leave running overnight)
 ./run.sh -l                        # list audio devices
+make local-network-prompt          # macOS: re-trigger the Local Network permission
+                                   #   prompt (see Known issues)
 
 # Or manually:
 PYTHONPATH=src python3 -m squeezy -n "Squeezy" -vv
@@ -284,6 +291,23 @@ Protocol spec: https://wiki.slimdevices.com/index.php/SlimProto_TCP_protocol
 ---
 
 ## Known issues
+
+### macOS Local Network permission → `[Errno 65] No route to host`
+macOS 15+ gates LAN traffic per process. When denied, `connect()`/`sendto()`
+to any LAN address fail with EHOSTUNREACH (kernel log: `tcp drop outgoing …
+reason: NECP`), which looks exactly like a routing problem. Homebrew's
+`python3` is a stub that execs `Python.app/Contents/MacOS/Python`, so the
+permission is judged against that bundle; iTerm2 disclaims responsibility for
+everything it spawns (`responsibility_spawnattrs_setdisclaim`, unconditional),
+so iTerm2's own grant doesn't cover us and macOS never prompts — it just
+denies. Apple's Terminal.app is special-cased and works.
+
+`network/local_network.py` handles it: `hint_for()` appends an explanation to
+the "Connection failed" error (and to a refused discovery broadcast), and
+`squeezy --request-local-network` re-spawns the probe with Python as its own
+responsible process — the one condition under which macOS *does* show the
+prompt. The grant is keyed to the exact Python binary path, so it has to be
+repeated after `brew upgrade python@3.x` (`make local-network-prompt`).
 
 ### Sync offset on macOS
 ~40-45ms LMS player offset still needed even with `--latency 40`. The dynamic

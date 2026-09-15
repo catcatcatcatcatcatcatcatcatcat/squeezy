@@ -54,6 +54,7 @@ from .config import metadata
 
 # Network and protocol modules
 from .network import server_connection
+from .network import local_network
 from .network import lms_metadata
 from .network import status_server
 
@@ -122,6 +123,7 @@ class Squeezy:
         self.bytes_received = 0
         self.server_timestamp = 0
         self._failed_connect_count = 0  # Reconnection fallback to UDP discovery
+        self._local_network_hinted = False  # explain EHOSTUNREACH once, not every retry
 
         # Audio buffer (thread-safe, shared by stream/decode/miniaudio threads)
         # --buffer-size CLI flag overrides default 4MB; clamped to 64KB-8MB range
@@ -690,6 +692,10 @@ class Squeezy:
             self.sock.connect((self.server_ip, slimproto.SLIMPROTO_PORT))
         except OSError as e:
             log.error("Connection failed: %s", e)
+            hint = local_network.hint_for(e, self.server_ip)
+            if hint and not self._local_network_hinted:
+                log.error(hint)
+                self._local_network_hinted = True
             return False
 
         self.sock.settimeout(slimproto.RECV_TIMEOUT_SEC)
@@ -2176,6 +2182,10 @@ def main():
                         help="Log multi-room sync/timing diagnostics (drift per heartbeat, "
                              "LMS corrections, clock steps, audio-device stalls) without "
                              "the rest of -vv. Safe to leave on long-term.")
+    parser.add_argument("--request-local-network", action="store_true",
+                        help="macOS: trigger the Local Network permission prompt for Python, "
+                             "check that LMS is reachable, and exit")
+    parser.add_argument("--local-network-probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=f"squeezy {VERSION}")
     args = parser.parse_args()
 
@@ -2197,6 +2207,11 @@ def main():
     # level is enough to let SYNC lines through while the rest stays quiet.
     if args.sync_debug:
         synclog.setLevel(logging.INFO)
+
+    if args.request_local_network:
+        sys.exit(local_network.request_access(args.server))
+    if args.local_network_probe:  # we are the re-spawned child of --request-local-network
+        sys.exit(local_network.probe(args.server))
 
     # Non-blocking update check
     threading.Thread(target=check_for_update, daemon=True).start()

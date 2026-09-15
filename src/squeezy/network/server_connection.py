@@ -10,6 +10,7 @@ import socket
 import threading
 
 from ..protocol import slimproto
+from . import local_network
 
 log = logging.getLogger("squeezy")
 
@@ -80,11 +81,17 @@ class ServerConnection:
         except ImportError:
             pass  # subnet broadcast above already covers the common case
 
+        # A macOS Local Network denial fails every sendto with EHOSTUNREACH,
+        # which would otherwise degrade silently into "No server found".
+        send_denied = None
         for attempt in range(slimproto.DISCOVERY_ATTEMPTS):
             for bcast in broadcast_addrs:
                 try:
                     sock.sendto(slimproto.UDP_DISCOVER_PROBE, (bcast, port))
-                except OSError:
+                    send_denied = False
+                except OSError as e:
+                    if send_denied is None:
+                        send_denied = local_network.hint_for(e, bcast)
                     continue
             try:
                 data, addr = sock.recvfrom(slimproto.DISCOVERY_RECV_SIZE)
@@ -95,6 +102,8 @@ class ServerConnection:
             except socket.timeout:
                 log.debug("Discovery attempt %d timed out", attempt + 1)
         sock.close()
+        if send_denied:
+            log.warning("Discovery broadcast refused by the OS. %s", send_denied)
 
         # UDP broadcast doesn't reach Docker containers even with port mapping,
         # and LMS ignores unicast UDP probes (only responds to broadcast).

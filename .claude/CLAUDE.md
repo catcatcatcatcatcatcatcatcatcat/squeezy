@@ -309,6 +309,13 @@ responsible process — the one condition under which macOS *does* show the
 prompt. The grant is keyed to the exact Python binary path, so it has to be
 repeated after `brew upgrade python@3.x` (`make local-network-prompt`).
 
+**Two Pythons, two grants.** `./run.sh` uses `/opt/homebrew/bin/python3`
+(python@3.14) while the Homebrew-installed `squeezy` runs from its libexec venv
+on whatever Python the formula pins (python@3.13 as of 0.8.0). Running
+`squeezy --request-local-network` checks *that* Python and says all clear while
+`./run.sh` stays denied — which is why the hint and the check print the
+resolved interpreter path and tell you to add the flag to the same command.
+
 ### Sync offset on macOS
 ~40-45ms LMS player offset still needed even with `--latency 40`. The dynamic
 wall-clock measurement correctly tracks the miniaudio buffer, but CoreAudio

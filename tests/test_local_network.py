@@ -36,6 +36,20 @@ class TestHintFor:
         assert "Local Network" in hint
         assert "--request-local-network" in hint
 
+    def test_hint_names_the_denied_interpreter(self, monkeypatch):
+        """The grant is per Python binary; ./run.sh and the brew squeezy use different ones."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(sys, "executable", "/opt/homebrew/bin/python3.99")
+        hint = local_network.hint_for(_unreachable(), "10.10.10.26")
+        assert "/opt/homebrew/bin/python3.99" in hint
+
+    def test_hint_points_at_the_same_command_not_a_different_install(self, monkeypatch):
+        """Telling run.sh users to run `squeezy ...` checks the wrong Python and says all clear."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        hint = local_network.hint_for(_unreachable(), "10.10.10.26")
+        assert "same command" in hint
+        assert "run `squeezy --request-local-network`" not in hint
+
     def test_other_errno_gives_no_hint(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
         err = OSError(errno.ECONNREFUSED, "Connection refused")
@@ -222,6 +236,15 @@ class TestRequestAccess:
         assert "--local-network-probe" in argv
         assert argv[argv.index("-s") + 1] == "10.10.10.26"
         assert "allowed" in capsys.readouterr().out.lower()
+
+    def test_reports_which_python_it_checked(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(sys, "executable", "/opt/homebrew/bin/python3.99")
+        with patch.object(local_network, "spawn_disclaimed", return_value=local_network.PROBE_ALLOWED):
+            local_network.request_access(None)
+        out = capsys.readouterr().out
+        assert "/opt/homebrew/bin/python3.99" in out
+        assert "squeezy can reach LMS" not in out  # it only proved *this* Python can
 
     def test_reports_denied_with_instructions(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "platform", "darwin")

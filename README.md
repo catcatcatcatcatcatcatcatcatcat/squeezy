@@ -109,8 +109,10 @@ squeezy --request-local-network -s 192.168.1.100   # click Allow when macOS asks
 ```
 
 The grant is tied to the exact Python binary, so repeat this after upgrading
-Python (e.g. `brew upgrade`). You can also toggle Python on under
-System Settings → Privacy & Security → Local Network.
+Python (e.g. `brew upgrade`), and run it with the same command you use to start
+squeezy — running from source (`./run.sh --request-local-network`) uses a
+different Python than the Homebrew-installed `squeezy`. You can also toggle
+Python on under System Settings → Privacy & Security → Local Network.
 
 ## Project Structure
 

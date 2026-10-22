@@ -33,10 +33,12 @@ log = logging.getLogger("squeezy")
 
 HINT = (
     'Hint: on macOS, "No route to host" to a LAN address usually means Local Network '
-    "access is denied for this process (System Settings > Privacy & Security > Local "
-    "Network). Terminals such as iTerm2 don't pass their permission on to the programs "
-    "they run, and macOS won't prompt for it — run `squeezy --request-local-network` "
-    "to trigger the prompt."
+    "access is denied for this Python ({python}). The permission is per Python binary, "
+    "so it is lost when Python is upgraded, and terminals such as iTerm2 don't pass "
+    "their own permission on or make macOS prompt for it. Re-run the same command with "
+    "--request-local-network added (e.g. `./run.sh --request-local-network` or "
+    "`squeezy --request-local-network`, whichever you just ran) to trigger the prompt "
+    "for this Python."
 )
 
 # Exit codes of the re-spawned probe (also what request_access() returns).
@@ -59,7 +61,12 @@ def hint_for(err, host):
             return None  # a real routing failure to the internet
     except ValueError:
         pass  # hostname — can't classify; a LAN name is the common case
-    return HINT
+    return HINT.format(python=_python())
+
+
+def _python():
+    """The interpreter the grant applies to (venv/brew symlinks resolved)."""
+    return os.path.realpath(sys.executable)
 
 
 def probe(server, port=slimproto.SLIMPROTO_PORT):
@@ -131,7 +138,7 @@ def request_access(server):
         print("Local Network permission is a macOS thing — nothing to do here.")
         return 0
 
-    print("Checking Local Network access as Python itself.")
+    print(f"Checking Local Network access for {_python()}")
     print("If macOS asks whether Python may find devices on your local network, click Allow.")
     argv = [sys.executable, "-m", "squeezy", "--local-network-probe"]
     if server:
@@ -139,7 +146,8 @@ def request_access(server):
     result = spawn_disclaimed(argv)
 
     if result == PROBE_ALLOWED:
-        print("Local Network access is allowed — squeezy can reach LMS.")
+        print("Local Network access is allowed for this Python, and it reached LMS.")
+        print("(Other Pythons — e.g. ./run.sh vs the brew-installed squeezy — need their own.)")
     elif result == PROBE_DENIED:
         print("Local Network access is denied for Python.")
         print("If a prompt just appeared, click Allow and run this again to confirm.")

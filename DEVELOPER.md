@@ -22,6 +22,7 @@ squeezy/
 │   │   └── lms_client.py       ← LMS message operations (HELO, STAT, DSCO)
 │   ├── network/
 │   │   ├── server_connection.py ← TCP/UDP socket management, discovery
+│   │   ├── local_network.py    ← macOS Local Network denial hint + prompt trigger
 │   │   ├── lms_metadata.py     ← LMS JSON-RPC track metadata queries
 │   │   └── status_server.py    ← Unix socket status server for external tools
 │   └── config/

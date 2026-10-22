@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -96,7 +97,7 @@ class Squeezy:
         config.save_player_name(name)
 
     def __init__(self, name=None, server=None, mac=None, device_id=None,
-                 latency_msec=None, buffer_size_kb=None):
+                 latency_msec=None, buffer_size_kb=None, ffmpeg=None):
         """Initialize the Squeezy player.
 
         Args:
@@ -107,7 +108,9 @@ class Squeezy:
             device_id: miniaudio device ID for audio output. If None, uses default.
             latency_msec: Override for OS audio pipeline latency (for sync tuning).
             buffer_size_kb: PCM buffer size in KB (default: 4096, range: 64-8192).
+            ffmpeg: Path to ffmpeg. If None, resolved via resolve_ffmpeg().
         """
+        self.ffmpeg = ffmpeg or resolve_ffmpeg() or "ffmpeg"
         # CLI name always wins; otherwise use saved name; otherwise default
         if name:
             self.name = name
@@ -331,17 +334,19 @@ class Squeezy:
         return None
 
     @staticmethod
-    def _probe_ffmpeg_codecs():
+    def _probe_ffmpeg_codecs(ffmpeg="ffmpeg"):
         """Probe ffmpeg for available decoders.
 
         Returns a list of codec short names that ffmpeg supports.
-        Falls back to a standard list if probing fails.
+        Falls back to a standard list if ffmpeg runs but probing fails, and to
+        PCM only if ffmpeg can't be run at all — advertising codecs we can't
+        decode makes LMS stream them to a player that then sits silent.
         """
         standard_codecs = ["pcm", "mp3", "flac", "ogg", "aac"]
 
         try:
             result = subprocess.run(
-                ["ffmpeg", "-decoders"],
+                [ffmpeg, "-decoders"],
                 capture_output=True,
                 text=True,
                 timeout=5
@@ -384,6 +389,9 @@ class Squeezy:
             if result_list:
                 log.debug("Detected ffmpeg decoders: %s", result_list)
                 return result_list
+        except OSError as e:
+            log.warning("Cannot run ffmpeg (%s): %s — advertising PCM only", ffmpeg, e)
+            return ["pcm"]
         except Exception as e:
             log.debug("Failed to probe ffmpeg codecs: %s, using defaults", e)
 
@@ -416,7 +424,7 @@ class Squeezy:
         #   pcm,mp3,flac,…     — codec list; LMS picks the first one it can serve
 
         # Probe ffmpeg for available decoders (P2.11: Codec Priority)
-        codecs = self._probe_ffmpeg_codecs()
+        codecs = self._probe_ffmpeg_codecs(self.ffmpeg)
         codec_str = ",".join(codecs)
 
         return (
@@ -1218,7 +1226,7 @@ class Squeezy:
             self._stream_to_buffer(leftover, threshold, autostart)
         else:
             # Build ffmpeg command — specify input format for raw PCM
-            ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            ffmpeg_cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error"]
             if fmt == "p" and pcm_info:
                 ffmpeg_cmd += ["-f", "s{0}{1}".format(pcm_info["bits"], pcm_info["endian"]),
                                "-ar", str(pcm_info["rate"]),
@@ -1228,12 +1236,24 @@ class Squeezy:
                            "pipe:1"]
             log.debug("ffmpeg command: %s", " ".join(ffmpeg_cmd))
 
-            self.ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+            try:
+                self.ffmpeg_proc = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except OSError as e:
+                # Report it as a decode error, as for a non-zero ffmpeg exit,
+                # rather than letting the worker's DSCO read as a clean end.
+                log.error("Cannot start ffmpeg (%s): %s", self.ffmpeg, e)
+                try:
+                    self.stream_sock.close()
+                except Exception:
+                    pass
+                self.stream_sock = None
+                self._send_stat("STMn")
+                return
 
             # For compressed formats, detect sample rate from ffmpeg output
             if fmt != "p":
@@ -2118,6 +2138,20 @@ class Squeezy:
                 pass
 
 
+def resolve_ffmpeg(override=None):
+    """Return an absolute path to an executable ffmpeg, or None.
+
+    Resolved once at startup rather than per-invocation: a bare "ffmpeg" works
+    from a shell but not under launchd/systemd, whose default PATH has no
+    /opt/homebrew/bin or /usr/local/bin.  Precedence: --ffmpeg, then
+    $SQUEEZY_FFMPEG, then PATH.  Either override may be a path (~ expanded)
+    or a bare name to look up on PATH.
+    """
+    candidate = override or os.environ.get("SQUEEZY_FFMPEG") or "ffmpeg"
+    path = shutil.which(os.path.expanduser(candidate))
+    return os.path.abspath(path) if path else None
+
+
 def list_audio_devices():
     """List available audio output devices."""
     devs = miniaudio.Devices()
@@ -2171,6 +2205,8 @@ def main():
     parser.add_argument("-s", "--server", help="LMS server IP (auto-discover if not set)")
     parser.add_argument("-n", "--name", default=None, help="Player name (default: saved name or 'Squeezy')")
     parser.add_argument("-m", "--mac", help="MAC address aa:bb:cc:dd:ee:ff (auto-detect if not set)")
+    parser.add_argument("--ffmpeg", metavar="PATH",
+                        help="Path to ffmpeg (default: $SQUEEZY_FFMPEG, then PATH)")
     parser.add_argument("-d", "--device", help="Audio output device (name or substring, e.g. 'HDMI')")
     parser.add_argument("-l", "--list-devices", action="store_true", help="List audio output devices and exit")
     parser.add_argument("--latency", type=int, default=None, metavar="MS",
@@ -2223,6 +2259,19 @@ def main():
         list_audio_devices()
         return
 
+    ffmpeg = resolve_ffmpeg(args.ffmpeg)
+    if not ffmpeg:
+        requested = args.ffmpeg or os.environ.get("SQUEEZY_FFMPEG")
+        log.error(
+            "ffmpeg not found%s. Pass --ffmpeg /path/to/ffmpeg or set "
+            "SQUEEZY_FFMPEG. Current PATH=%s — note that launchd and systemd "
+            "do not include /opt/homebrew/bin or /usr/local/bin by default.",
+            f" at {requested}" if requested else "",
+            os.environ.get("PATH", ""),
+        )
+        sys.exit(1)
+    log.debug("Using ffmpeg: %s", ffmpeg)
+
     # Resolve audio device
     device_id = None
     if args.device:
@@ -2236,7 +2285,7 @@ def main():
 
     player = Squeezy(name=args.name, server=args.server, mac=args.mac,
                      device_id=device_id, latency_msec=args.latency,
-                     buffer_size_kb=args.buffer_size)
+                     buffer_size_kb=args.buffer_size, ffmpeg=ffmpeg)
 
     def handle_signal(sig, frame):
         if not player.running:

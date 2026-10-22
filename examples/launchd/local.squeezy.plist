@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchAgent for running squeezy in the background on macOS.
+  See README.md in this directory for install steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.squeezy</string>
+
+    <!-- /opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel,
+         ~/.local/bin (spelled out in full) for pipx. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/squeezy</string>
+        <string>-n</string><string>Squeezy</string>
+    </array>
+
+    <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which has
+         no Homebrew ffmpeg; without this squeezy exits with "ffmpeg not found".
+         Setting SQUEEZY_FFMPEG here, or adding the ffmpeg option to
+         ProgramArguments, works too (see README.md). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Keeps launchd from throttling a realtime audio process. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- squeezy logs warnings and errors to stderr. -->
+    <key>StandardErrorPath</key>
+    <string>/tmp/squeezy.log</string>
+</dict>
+</plist>

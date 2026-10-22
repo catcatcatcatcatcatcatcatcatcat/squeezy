@@ -11,7 +11,7 @@ or this codebase.
 ```
 squeezy/
 ├── src/squeezy/                ← the player (modular package)
-│   ├── squeezy.py              ← main orchestrator (~1,780 lines)
+│   ├── squeezy.py              ← main orchestrator (~2,300 lines)
 │   ├── __init__.py             ← package marker
 │   ├── __main__.py             ← enables `python -m squeezy`
 │   ├── audio/
@@ -35,12 +35,20 @@ squeezy/
 ├── Dockerfile              ← Linux test environment
 ├── README.md               ← user-facing docs
 ├── DEVELOPER.md            ← this file
-├── TODO.md                 ← backlog of known improvements
+├── BACKLOG.md              ← backlog of known improvements
+│
+├── examples/
+│   └── launchd/            ← example macOS LaunchAgent + notes
 │
 ├── tests/                  ← automated tests
 │   ├── conftest.py
 │   ├── test_p1_reliability.py  ← 14 unit tests (connection, heartbeat, state)
 │   ├── test_p2_features.py     ← 41 unit tests (gapless, crossfade, gain, ICY)
+│   ├── test_p3_robustness.py   ← 29 unit tests (MP3 gapless, PCMBuffer, DSCO, shutdown)
+│   ├── test_sync.py            ← 29 unit tests (sync corrections, output gate)
+│   ├── test_local_network.py   ← 27 unit tests (macOS Local Network hint + prompt)
+│   ├── test_mac.py             ← 24 unit tests (player MAC detection + fallback)
+│   ├── test_ffmpeg.py          ← 15 unit tests (ffmpeg resolution + failure reporting)
 │   ├── test_integration.py     ← 14 integration tests (needs LMS + ffmpeg)
 │   ├── lms_client.py
 │   └── linux_distro_test.sh

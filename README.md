@@ -75,8 +75,12 @@ squeezy
 # Specify server and player name
 squeezy -s 192.168.1.100 -n "Kitchen Speaker"
 
-# Custom MAC address (for persistent player identity)
+# Pin the MAC address LMS uses as the player ID (default: this machine's
+# hardware address, so the player keeps its settings across restarts)
 squeezy -m aa:bb:cc:dd:ee:ff
+
+# Point at a specific ffmpeg (default: $SQUEEZY_FFMPEG, then PATH)
+squeezy --ffmpeg /opt/homebrew/bin/ffmpeg
 
 # List available audio output devices
 squeezy -l
@@ -95,6 +99,24 @@ squeezy --version
 ```
 
 Your player will appear in the Lyrion Music Server web UI. Select it from the player dropdown to start streaming.
+
+### Running in the background (launchd / systemd)
+
+Service managers start programs with a minimal `PATH` that usually doesn't
+include Homebrew's ffmpeg, and squeezy exits with `ffmpeg not found` if it
+can't find it. Set `PATH` in the service, or pass `--ffmpeg` / set
+`SQUEEZY_FFMPEG`. For macOS there's a ready-made LaunchAgent in
+[examples/launchd](examples/launchd/).
+
+### Upgrading from 0.8.x on macOS 26+: new player ID
+
+Up to 0.8.x, squeezy on macOS 26 and later reported the placeholder MAC
+`02:00:00:00:00:00`, so every Mac claimed the same player ID and two players
+kept knocking each other off LMS. From 0.9.0 it uses the Mac's hardware address
+instead. LMS will show it as a **new** player with an empty playlist and
+default settings, and leave the old `02:00:00:00:00:00` entry under Settings →
+Players, where you can remove it. To keep the old player on a single Mac, pass
+`-m 02:00:00:00:00:00`.
 
 ### macOS: `Connection failed: [Errno 65] No route to host`
 
@@ -133,6 +155,9 @@ src/squeezy/
 └── config/
     ├── config.py           # XDG-compliant config persistence
     └── metadata.py         # ICY metadata & LAME gapless parsing
+
+examples/
+└── launchd/                # Example macOS LaunchAgent
 ```
 
 ## Contributing

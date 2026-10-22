@@ -27,12 +27,12 @@ A minimal Python reimplementation of **squeezelite** — a software player for
 ### Module structure
 ```
 src/squeezy/
-├── squeezy.py                  # Main orchestrator, audio pipeline, CLI (~1,780 lines)
+├── squeezy.py                  # Main orchestrator, audio pipeline, CLI (~2,300 lines)
 ├── audio/
 │   └── stream_decoder.py       # Thread-safe PCMBuffer (bounded, backpressure)
 ├── protocol/
 │   ├── handler.py              # SlimProto message handlers (strm, audg, setd, etc.)
-│   ├── slimproto.py            # Protocol constants & packet builders
+│   ├── slimproto.py            # Protocol constants, packet builders, player MAC
 │   └── lms_client.py           # SlimProto message sending (HELO, STAT, DSCO, etc.)
 ├── network/
 │   ├── server_connection.py    # TCP/UDP socket management, discovery
@@ -40,7 +40,7 @@ src/squeezy/
 │   ├── lms_metadata.py         # LMS JSON-RPC track metadata queries
 │   └── status_server.py        # Unix socket status server for external tools
 └── config/
-    ├── config.py               # XDG-compliant config persistence
+    ├── config.py               # XDG-compliant config persistence (incl. fallback MAC)
     └── metadata.py             # ICY metadata & LAME gapless parsing
 ```
 
@@ -180,6 +180,29 @@ payload-relative. All offsets are documented in the `_handle_strm_start`
 docstring. When modifying protocol parsing, always verify against those
 comments — a mismatch caused 10 test failures during a past refactor.
 
+### Player MAC: don't trust `uuid.getnode()` blindly (fixed in 0.9.0)
+The MAC is our LMS player ID, and LMS keys players by it. On macOS 26+
+`uuid.getnode()` returns the placeholder `02:00:00:00:00:00` (Python only
+rejects the multicast bit, not the locally-administered one), so every Mac
+claimed the same ID and two players evicted each other every few seconds —
+both silent, never opening port 9000, while LMS still reported `mode:play`.
+`slimproto.default_mac()` still uses `getnode()` when the result is usable —
+that keeps every existing player ID on Linux, Windows and older macOS — and
+only otherwise reads interfaces: `/sys/class/net` on Linux,
+`networksetup -listallhardwareports` on macOS (**not** `ifconfig`, which shows
+the rotating Private Wi-Fi address for en0), else `ifconfig -a`, accepting only
+globally unique addresses. `config.load_or_create_mac()` persists a random one
+when nothing qualifies (e.g. containers, where getnode() is random per run).
+Any change here changes users' player IDs.
+
+### ffmpeg resolved once, failures loud (fixed in 0.9.0)
+`resolve_ffmpeg()` (`--ffmpeg`, then `$SQUEEZY_FFMPEG`, then `PATH`) runs at
+startup and exits if nothing is found. launchd/systemd don't put Homebrew on
+`PATH`, and the old failure was silent: the codec probe still advertised FLAC
+and the decoder's `FileNotFoundError` was swallowed by `_stream_worker` (it only
+logs once `self.streaming` is set). If ffmpeg can't run, the probe advertises
+PCM only and the decoder launch logs an error.
+
 ---
 
 ## Key constants (`protocol/slimproto.py`)
@@ -201,7 +224,7 @@ PCM_BUF_MAX_SIZE = 4MB       # PCMBuffer default max (~23s at 44.1k stereo)
 
 ## Testing
 
-**137 unit tests + 14 integration = 151 total:**
+**179 unit tests + 14 integration = 193 total:**
 ```bash
 PYTHONPATH=src python3 -m pytest tests/                        # all unit tests
 PYTHONPATH=src python3 -m pytest tests/test_p1_reliability.py  # P1 only
@@ -209,6 +232,8 @@ PYTHONPATH=src python3 -m pytest tests/test_p2_features.py     # P2 only
 PYTHONPATH=src python3 -m pytest tests/test_p3_robustness.py   # P3 only
 PYTHONPATH=src python3 -m pytest tests/test_sync.py            # sync/timing only
 PYTHONPATH=src python3 -m pytest tests/test_local_network.py   # macOS Local Network only
+PYTHONPATH=src python3 -m pytest tests/test_mac.py             # player MAC detection only
+PYTHONPATH=src python3 -m pytest tests/test_ffmpeg.py          # ffmpeg resolution only
 make test                                                       # shortcut
 ```
 
@@ -222,9 +247,14 @@ make test                                                       # shortcut
 - Sync (29 tests) — pause-interval, skip-ahead, pause-frames in the generator,
   the gapless output gate (synced boundaries), truthful anchor elapsed,
   clock-step and audio-stall detection
-- Local Network (24 tests) — EHOSTUNREACH hint classification, hint logged once
+- Local Network (27 tests) — EHOSTUNREACH hint classification (names the denied
+  interpreter, points at the same command), hint logged once
   from connect() and from discovery, probe exit codes, disclaimed re-spawn (macOS only),
   `--request-local-network` / `--local-network-probe` CLI wiring
+- MAC (24 tests) — getnode() kept when usable, macOS 26 placeholder rejected,
+  networksetup over ifconfig, Linux sysfs, persisted fallback (incl. read-only dir)
+- ffmpeg (15 tests) — `--ffmpeg` / `SQUEEZY_FFMPEG` / PATH resolution, exit on
+  missing, PCM-only probe, decoder launch failure → STMn
 - Integration (14 tests) — end-to-end with real LMS
 
 ---

@@ -115,7 +115,10 @@ class Squeezy:
             saved_name = self._load_player_name()
             self.name = saved_name if saved_name else "Squeezy"
         self.server_ip = server
-        self.mac = slimproto.mac_from_string(mac) if mac else slimproto.default_mac()
+        if mac:
+            self.mac = slimproto.mac_from_string(mac)
+        else:
+            self.mac = slimproto.default_mac() or config.load_or_create_mac()
         self.audio_device_id = device_id
         self.sock = None
         self.running = False

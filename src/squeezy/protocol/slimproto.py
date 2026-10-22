@@ -7,9 +7,16 @@ parsing, with zero dependency on the Squeezy class or player state.
 Reference: https://wiki.slimdevices.com/index.php/SlimProto_TCP_protocol
 """
 
+import logging
+import os
+import re
 import struct
+import subprocess
+import sys
 import time
 import uuid
+
+log = logging.getLogger("squeezy")
 
 # ---------------------------------------------------------------------------
 # SlimProto protocol constants
@@ -265,10 +272,139 @@ def mac_from_string(mac_str):
     return bytes(int(b, 16) for b in mac_str.split(":"))
 
 
+# Addresses that are never a usable player identity: the placeholder macOS 26+
+# returns from uuid.getnode(), and the all-zero address some stacks report for
+# an interface that is down.
+PLACEHOLDER_MACS = frozenset({
+    b"\x02\x00\x00\x00\x00\x00",
+    b"\x00\x00\x00\x00\x00\x00",
+})
+
+# Interfaces to consider before whatever order the OS reports.
+PREFERRED_INTERFACES = ("en0", "eth0")
+
+SYSFS_NET = "/sys/class/net"
+
+
+def _run(argv):
+    """Return argv's stdout, or "" if it can't be run."""
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _macos_hardware_port_macs():
+    """Return [(iface_name, mac_string)] from `networksetup -listallhardwareports`.
+
+    Unlike ifconfig, this reports each port's burned-in address.  With Private
+    Wi-Fi Address on, ifconfig shows en0's randomised (and possibly rotating)
+    address instead, which would give us a new LMS player ID on every rotation.
+    """
+    macs = []
+    name = None
+    for line in _run(["/usr/sbin/networksetup", "-listallhardwareports"]).splitlines():
+        if line.startswith("Device:"):
+            name = line.split(":", 1)[1].strip()
+        found = re.match(r"Ethernet Address:\s+([0-9a-fA-F:]{17})\b", line)
+        if found and name:
+            macs.append((name, found.group(1).lower()))
+            name = None
+    return macs
+
+
+def _ifconfig_macs():
+    """Return [(iface_name, mac_string)] parsed from `ifconfig -a`."""
+    macs = []
+    name = None
+    for line in _run(["/sbin/ifconfig", "-a"]).splitlines():
+        if line[:1].strip():                 # a new interface stanza
+            name = line.split(":", 1)[0]
+        found = re.search(r"\bether\s+([0-9a-fA-F:]{17})\b", line)
+        if found and name:
+            macs.append((name, found.group(1).lower()))
+    return macs
+
+
+def _interface_macs():
+    """Return [(iface_name, mac_string)] for every interface the OS reports.
+
+    Linux exposes these under /sys/class/net; macOS asks networksetup for the
+    hardware addresses, and the BSDs (or a macOS without networksetup) fall
+    back to ifconfig.  All best-effort: a host that reports nothing yields [].
+    """
+    if os.path.isdir(SYSFS_NET):
+        macs = []
+        for name in sorted(os.listdir(SYSFS_NET)):
+            try:
+                with open(os.path.join(SYSFS_NET, name, "address")) as fh:
+                    macs.append((name, fh.read().strip()))
+            except OSError:
+                continue
+        return macs
+
+    if sys.platform == "darwin":
+        macs = _macos_hardware_port_macs()
+        if macs:
+            return macs
+    return _ifconfig_macs()
+
+
+def is_usable_mac(mac):
+    """True unless `mac` is a placeholder, all zeros, or a multicast address."""
+    if len(mac) != 6 or mac in PLACEHOLDER_MACS or not any(mac):
+        return False
+    return not (mac[0] & 0x01)
+
+
+def is_global_mac(mac):
+    """True when `mac` is a globally unique (burned-in) hardware address.
+
+    Locally administered addresses (bit 0x02 of the first octet) are excluded:
+    on macOS that covers bridge0, awdl0, llw0, anpi*, Thunderbolt, Private
+    Wi-Fi addresses and the uuid.getnode() placeholder; on Linux, Docker's
+    02:42:* and randomised Wi-Fi.  None of these make a stable player identity.
+    """
+    return is_usable_mac(mac) and not (mac[0] & 0x02)
+
+
 def default_mac():
-    """Generate a MAC address from system UUID."""
-    node = uuid.getnode()
-    return node.to_bytes(6, "big")
+    """Return this host's MAC address for use as our LMS player ID.
+
+    uuid.getnode() is still the first choice: it is what every earlier release
+    used, so keeping it leaves existing player IDs alone wherever it works.  But
+    macOS 26+ returns the placeholder 02:00:00:00:00:00 from it, and because
+    0x02 is the locally-administered bit rather than the multicast bit that
+    getnode() screens for, it is handed back as if it were genuine hardware.
+    Every Mac then presents the same player ID, and since LMS keys players by
+    MAC, two players evict each other on connect: each reconnects every few
+    seconds, neither opens its stream socket, and both stay silent while LMS
+    still reports mode:play.  getnode() also falls back to a random multicast
+    node — a new player per restart — when it finds no interface at all.
+
+    So a placeholder or multicast result is rejected, and we read the interfaces
+    ourselves, accepting only a globally unique address.  Returns None when
+    there is none, leaving the caller to supply a persisted fallback.
+    """
+    node = uuid.getnode().to_bytes(6, "big")
+    if is_usable_mac(node):
+        return node
+
+    found = _interface_macs()
+    ordered = [c for c in found if c[0] in PREFERRED_INTERFACES] + found
+    for name, mac_str in ordered:
+        try:
+            mac = mac_from_string(mac_str)
+        except (ValueError, TypeError):
+            continue
+        if is_global_mac(mac):
+            log.debug("uuid.getnode() gave %s; using MAC %s from interface %s",
+                      node.hex(":"), mac_str, name)
+            return mac
+    return None
 
 
 def encode_fixed_point_gain(gain_float):

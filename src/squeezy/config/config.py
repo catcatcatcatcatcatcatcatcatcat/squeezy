@@ -113,3 +113,40 @@ def load_last_server():
     except Exception as e:
         log.warning("Failed to load last server: %s", e)
     return None, 0.0
+
+
+MAC_FILE = "mac"
+
+
+def load_or_create_mac():
+    """Return a persisted random MAC, minting one on first use.
+
+    Only reached when no real interface address is available.  Persisting it
+    matters: the MAC is our LMS player ID, so a value regenerated per start
+    would register a new player — losing volume, sync group and playlist — on
+    every restart.  Never raises: with no writable config dir the player still
+    starts, just with an ID that won't survive a restart.
+    """
+    generated = bytearray(os.urandom(6))
+    generated[0] = (generated[0] | 0x02) & 0xFE    # locally administered, unicast
+    generated = bytes(generated)
+
+    try:
+        path = os.path.join(get_config_dir(), MAC_FILE)
+        try:
+            with open(path) as fh:
+                mac = bytes(int(b, 16) for b in fh.read().strip().split(":"))
+            if len(mac) == 6:
+                return mac
+        except (OSError, ValueError):
+            pass                                    # missing or corrupt: replace it
+
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(generated.hex(":"))
+        os.replace(tmp, path)                       # atomic: never a torn file
+        log.info("No hardware MAC found; generated player MAC %s", generated.hex(":"))
+    except OSError as e:
+        log.warning("Could not persist generated MAC %s (%s) — the player ID "
+                    "will change on restart; pass -m to pin it", generated.hex(":"), e)
+    return generated
